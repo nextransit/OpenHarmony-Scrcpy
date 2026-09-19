@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# 虚拟环境
+venv/
+venv312/
+.venv/
+
+# 日志和临时
+logs/
+*.log
+*.bak
+.pytest_cache/
+.cache/
+*.swp
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 系统文件
+.DS_Store
+Thumbs.db
