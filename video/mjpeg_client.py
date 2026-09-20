@@ -42,9 +42,9 @@ class MjpegStreamClient:
     # rx_queue 堆积几 MB, client 一直 socket.readinto 阻塞等响应头.
     # 实测: 50ms 间隔下 poll 线程在 socket.readinto 卡死; 改为 200ms 起步, 然后自适应
     # (上次请求快就降一点, 慢就升一点) 才能稳定拉到帧.
-    POLL_INTERVAL_MS_MIN = 100   # 最快 100ms (10 fps 上限)
-    POLL_INTERVAL_MS_MAX = 1000  # 最慢 1s (1 fps 下限, 给慢设备喘息)
-    POLL_INTERVAL_MS = 200       # 起步 200ms (5 fps), 然后自适应调整
+    POLL_INTERVAL_MS_MIN = 50    # 最快 50ms (尽量贴近设备截图节奏)
+    POLL_INTERVAL_MS_MAX = 600   # 最慢 600ms (网络/设备很慢时让出)
+    POLL_INTERVAL_MS = 100       # 起步 100ms, 然后自适应调整
     
     def __init__(
         self,
@@ -209,51 +209,42 @@ class MjpegStreamClient:
                         continue
                     jpeg_bytes = resp.read()
                     elapsed_ms = (time.time() - t_start) * 1000
-                    # 自适应间隔: 太快降一点, 太慢升一点, 卡死/超时则升到 MAX
-                    if elapsed_ms < 80:
+                    # 自适应间隔: 太快降一点, 太慢升一点.
+                    # 注意: hdc fport 隧道单帧传输 200-300ms (145KB JPEG) 属正常,
+                    # 阈值必须高于这个数, 否则会把轮询间隔一路推满, FPS 被压到 1-3.
+                    if elapsed_ms < 120:
                         current_poll_ms = max(self.POLL_INTERVAL_MS_MIN,
                                               int(current_poll_ms * 0.8))
-                    elif elapsed_ms > 200:
+                    elif elapsed_ms > 500:
                         current_poll_ms = min(self.POLL_INTERVAL_MS_MAX,
                                               int(current_poll_ms * 1.3))
                     self.total_bytes += len(jpeg_bytes)
                     self.last_data_time = time.time()
                     
-                    # 解析失败重试: 设备端 snapshot_display 写 screen.jpeg.tmp + atomic mv 到
-                    # screen.jpeg, 与 busybox httpd 的 sendfile 之间有微小竞争窗口.
-                    # 老代码 sleep 0.1 浪费时间, 改成: 立即重拉 (最多 3 次).
+                    # 设备端 snapshot_display 写 screen.jpeg.tmp + atomic mv 到 screen.jpeg,
+                    # 与 busybox httpd 的 sendfile 之间有微小竞争窗口, 可能拿到截断字节.
+                    # 旧实现用 `for retry in range(3)` + 不存在的 s.get 重拉: s 未定义会抛
+                    # NameError 被吞掉, 导致该帧被丢弃、poll 间隔被拉大 (FPS 掉到 1-3).
+                    # 截断是字节内容问题, 同 bytes 再解 3 次结果一样.
+                    # 简化: 解一次, 失败就跳过本帧, 下一轮 poll 拉新帧 (设备端 ~150ms 覆写一次).
                     arr = None
                     last_err = None
-                    for retry in range(3):
-                        try:
-                            img = Image.open(io.BytesIO(jpeg_bytes))
-                            img.draft("RGB", (self.config.width // 2, self.config.height // 2))
-                            img = img.convert("RGB")  # 真正解码在此, truncated 在这抛
-                            with self._target_size_lock:
-                                tw, th = self._target_size
-                            if tw > 0 and th > 0 and img.size != (tw, th):
-                                img = img.resize((tw, th), Image.Resampling.BOX)
-                            arr = np.asarray(img)
-                            break  # 成功
-                        except Exception as e:
-                            last_err = e
-                            # truncated: 立即重拉. 不 sleep (sleep 会拖慢整轮).
-                            if "truncated" not in str(e).lower() and retry == 0:
-                                # 非 truncated 错误 (真出错), 没必要重试
-                                break
-                            if retry < 2:
-                                # 重新拉一次
-                                try:
-                                    r2 = s.get(self.url, timeout=10, stream=False)
-                                    if r2.status_code == 200:
-                                        jpeg_bytes = r2.content
-                                except Exception:
-                                    pass
-                    if arr is None:
+                    try:
+                        img = Image.open(io.BytesIO(jpeg_bytes))
+                        img.draft("RGB", (self.config.width // 2, self.config.height // 2))
+                        img = img.convert("RGB")  # 真正解码在此, truncated 在这抛
+                        with self._target_size_lock:
+                            tw, th = self._target_size
+                        if tw > 0 and th > 0 and img.size != (tw, th):
+                            img = img.resize((tw, th), Image.Resampling.BOX)
+                        arr = np.asarray(img)
+                    except Exception as e:
+                        last_err = e
                         self.bad_packet_bytes += len(jpeg_bytes)
                         if self.bad_packet_bytes % 1000 < len(jpeg_bytes):
-                            print_log(LogLevel.WARN, self.log_title, f"JPEG 解析失败 (3 次重试后): {last_err}")
-                        # 不 sleep, 直接下一轮 (50ms 后下一轮 poll)
+                            print_log(LogLevel.WARN, self.log_title,
+                                f"JPEG 解析失败, 跳过本帧: {last_err}")
+                        # 跳过本帧, 直接下一轮 (下一轮 poll 会拿到新 bytes)
                         continue
                     
                     # 帧质量检测 (MJPEG 模式: 设备端直出 JPEG, 几乎不会有马赛克.
@@ -345,21 +336,22 @@ class MjpegStreamClient:
         """心跳超时监控"""
         print_log(LogLevel.INFO, self.log_title, "监控线程启动")
         from core.constants import HEARTBEAT_TIMEOUT
-        while not self._stop_event.is_set() and self.is_connected:
-            try:
+        try:
+            while not self._stop_event.is_set() and self.is_connected:
                 current_time = time.time()
                 if self.frame_count > 0 and current_time - self.last_data_time > HEARTBEAT_TIMEOUT:
                     print_log(LogLevel.ERROR, self.log_title,
                         f"心跳超时 ({current_time - self.last_data_time:.1f}秒),断开连接")
                     self.disconnect()
                     break
-                time.sleep(1)
-            except Exception as e:
-                if not self._stop_event.is_set():
-                    print_log(LogLevel.ERROR, self.log_title, f"监控异常: {e}")
-            print_log(LogLevel.INFO, self.log_title,
-                f"监控线程退出: stop_event={self._stop_event.is_set()} is_connected={self.is_connected}")
-        print_log(LogLevel.INFO, self.log_title, "监控线程结束")
+                # 用 wait 替代 sleep, 断开时能立即唤醒; 同时避免每次循环刷日志
+                self._stop_event.wait(1.0)
+        except Exception as e:
+            if not self._stop_event.is_set():
+                print_log(LogLevel.ERROR, self.log_title, f"监控异常: {e}")
+        # 退出日志只在真正退出时打一次 (旧实现误写在 while 内, 每秒刷屏)
+        print_log(LogLevel.INFO, self.log_title,
+            f"监控线程退出: stop_event={self._stop_event.is_set()} is_connected={self.is_connected}")
     
     @staticmethod
     def _is_conn_alive(conn) -> bool:

@@ -24,15 +24,30 @@ else
     bad "venv312 不存在, 请运行 python3 -m venv venv312 && pip install -r requirements.txt"
 fi
 
-section "hdc 二进制 (三平台)"
-for plat_dir in hdc/Linux/x64 hdc/Darwin/x64 hdc/Windows/x64; do
-    if [ -d "$plat_dir" ]; then
-        files=$(ls "$plat_dir" 2>/dev/null | tr '\n' ' ')
-        ok "$plat_dir: $files"
+section "hdc 二进制 (本平台)"
+# 按当前平台/架构检查 hdc 子目录 (与 core/platform_utils.py detect_arch 一致)
+case "$(uname -s)" in
+  Darwin) PLAT="Darwin" ;;
+  Linux)  PLAT="Linux" ;;
+  *)      PLAT="$(uname -s)" ;;
+esac
+case "$(uname -m)" in
+  x86_64|amd64) ARCH="x64" ;;
+  arm64|aarch64) ARCH="arm64" ;;
+  *) ARCH="$(uname -m)" ;;
+esac
+PLAT_DIR="hdc/$PLAT/$ARCH"
+if [ -d "$PLAT_DIR" ]; then
+    files=$(ls "$PLAT_DIR" 2>/dev/null | tr '\n' ' ')
+    ok "$PLAT_DIR: $files"
+    if [ -x "$PLAT_DIR/hdc" ] || [ -f "$PLAT_DIR/hdc" ]; then
+        ok "$PLAT_DIR/hdc 存在"
     else
-        bad "$plat_dir 不存在"
+        bad "$PLAT_DIR/hdc 不存在"
     fi
-done
+else
+    bad "$PLAT_DIR 不存在"
+fi
 
 section "启动脚本"
 for script in run_linux.sh run_macos.command run_windows.bat; do
