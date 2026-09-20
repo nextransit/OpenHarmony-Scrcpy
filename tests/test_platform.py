@@ -62,8 +62,8 @@ class TestHdcPath(unittest.TestCase):
 
 class TestVenv(unittest.TestCase):
     def test_venv312_python_path(self):
-        py = get_venv_python("/home/ben/ohscrcpy")
-        if is_venv_available("/home/ben/ohscrcpy"):
+        py = get_venv_python(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        if is_venv_available(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
             self.assertTrue(py.endswith("python.exe") if detect_platform() == "windows" else py.endswith("python"))
             print(f"  [get_venv_python] {py}")
         else:
@@ -71,7 +71,7 @@ class TestVenv(unittest.TestCase):
 
     def test_is_venv_available(self):
         # 项目目录存在 venv312
-        result = is_venv_available("/home/ben/ohscrcpy")
+        result = is_venv_available(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         print(f"  [is_venv_available] {result}")
 
 
@@ -79,7 +79,7 @@ class TestSetupEnvironment(unittest.TestCase):
     def test_setup_environment_no_error(self):
         """setup_environment 在 hdc 存在时不应抛异常."""
         try:
-            hdc_path = setup_environment("/home/ben/ohscrcpy")
+            hdc_path = setup_environment(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             self.assertIsNotNone(hdc_path)
             self.assertTrue(os.path.exists(hdc_path))
             # PATH 应已包含 hdc 子目录
