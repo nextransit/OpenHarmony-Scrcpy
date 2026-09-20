@@ -1,242 +1,193 @@
-# OHScrcpy_Client - OpenHarmony投屏工具客户端
+# OHScrcpy — OpenHarmony 投屏工具
 
-   OHScrcpy是一款为OpenHarmony系统设计的投屏工具软件，功能类似Android平台的scrcpy投屏工具。它能够将OpenHarmony设备的屏幕实时镜像到计算机，并提供设备控制功能。
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)]()
 
-## 特性
-- **实时屏幕镜像**：低延迟显示OpenHarmony设备屏幕
-- **设备控制**：支持点击、滑动、按键等操作
-- **多种连接方式**：支持USB连接和网络连接
-- **多设备管理**：支持同时连接多个设备并切换
-- **自适应分辨率**：自动调整显示尺寸，保持原始比例
-- **性能监控**：实时显示FPS、网络状态等统计信息
-- **调试功能**：内置调试工具，便于问题排查
-- **服务自动安装和启动**：服务端自动安装和启动
+类似 Android `scrcpy`,但专为 **OpenHarmony** 设备设计(适配 RK3568 等)。
+低延迟屏幕镜像 + 鼠标/键盘控制 + 全平台 GUI 客户端。
 
-## 系统要求
+## ✨ 特性
 
-### 计算机侧
-- **操作系统**：Windows/Linux/macOS
-- **Python版本**：Python 3.7或更高版本
-- **网络**：支持USB hdc连接
+- 📺 **实时屏幕镜像**:1080p @ 10-18 FPS(MJPEG 模式)
+- 🖱️ **鼠标控制**:点击/滑动/拖拽, 坐标自动换算
+- ⌨️ **键盘映射**: F1=主页 / F2=返回 / D-pad 选择图标 / 字母数字字符
+- 🎨 **现代 UI**: Slate 暗色主题 + 品牌 Logo + 启动画面 + 状态指示器动画
+- 🔌 **三平台支持**: Linux / macOS / Windows,统一启动脚本
+- 🛠️ **零外部依赖**(除 Pillow / numpy / av / psutil),纯 Python + Tkinter
 
-### OpenHarmony设备侧
-- **系统版本**：OpenHarmony 5.0或更高版本（**root版本**）
-- **权限**：需要USB调试权限
+## 📦 系统要求
 
-## 开发指南
+| | 最低 | 推荐 |
+|---|---|---|
+| 设备 | OpenHarmony 5.0+(root) | RK3568 + OH3.5 |
+| Python | 3.9 | 3.12 |
+| 内存 | 200 MB | 500 MB |
+| 网络 | USB 或 TCP/IP | TCP/IP(局域网) |
 
-### 核心模块
-   1. **HDCCommandExecutor**：HDC命令执行器
-   2. **ServerManager**：服务端管理器
-   3. **DeviceManager**：设备管理器
-   4. **VideoDecoder**：H.265/H.264视频解码器
-   5. **VideoStreamClient**：视频流客户端
-   6. **DeviceController**：设备控制器
-   7. **OHScrcpyGUI**：图形用户界面
+## 🚀 快速开始
 
-### 协议说明
-   程序使用自定义TCP协议进行通信：
-- **数据包格式**：4字节包类型 + 4字节数据长度 + 数据内容
-- **包类型**：心跳、SPS、PPS、VPS、关键帧、普通帧、配置信息
+### 1. 克隆 / 下载项目
 
-
-## 使用方法
-
-### 1. 连接设备
-   1. **USB连接**：
-      - 使用USB数据线连接OpenHarmony设备到计算机
-      - 在设备上启用USB调试模式
-      - 首次连接时，需要在设备上授权调试权限
-   2. **网线/Wi-Fi连接**：
-      - 确保设备和计算机在同一局域网（有线/无线）或者用网线将设备和计算机直连
-
-### 2. 启动客户端GUI程序
-- **前置条件**：本地新建一个目录`OpenHarmony_Scrcpy`，将`Client`目录下的`所有目录` 和 `main.py`、`Server\bin\rk3568`目录下的`ohscrcpy_server`、`Server\`目录下的`ohscrcpy_server.cfg`拷贝到本地`OpenHarmony_Scrcpy`目录；如果是HarmonyOS设备，还需要在本地`OpenHarmony_Scrcpy`目录下新建一个名为`HUAWEI`的目录，然后将`Server\bin\harmonyos`目录下的`ohscrcpy_server`拷贝到本地`HUAWEI`目录下的。
-
-- 系统控制台（命令行环境）启动客户端
 ```bash
-python main.py
-```
-   1. 运行程序后，主界面将显示
-   2. 点击`刷新`按钮扫描可用设备
-   3. 从`设备列表`中选择要连接的设备
-   4. 点击`连接`按钮开始投屏
-
-![客户端启动GUI.png](./客户端启动GUI.png '客户端启动GUI.png')
-![客户端投屏GUI.png](./客户端投屏GUI.png '客户端投屏GUI.png')
-
-### 3. 基本操作
-
-#### 屏幕控制
-- **点击**：在视频区域`单击鼠标左键`
-- **滑动**：在视频区域`按住鼠标左键并拖动`
-- **缩放**：程序自动适应窗口大小，保持原始比例
-
-#### 按键控制
-- **电源键**：点击**电源**按钮，唤醒/关闭屏幕显示
-- **主页键**：点击**主页**按钮，从前台应用返回桌面
-- **返回键**：点击**返回**按钮，返回上一UI页面
-- **解锁键**：点击**解锁**按钮，解锁屏幕
-- **音量+**：点击<strong>音量+</strong>按钮，增大音量
-- **音量-**：点击<strong>音量-</strong>按钮，减小音量
-
-### 5. 快捷键
-
-| 快捷键 | 功能 |
-|--------|------|
-| F5 | 刷新设备列表 |
-| F6 | 保存当前帧为调试图像 |
-| F8 | 显示调试信息窗口 |
-| F9 | 强制垃圾回收 |
-| F12 | 启用/禁用 键盘映射(把主机按键转发到设备) |
-
-#### 键盘映射 (F12 启用后)
-
-把主机的按键事件转发到 OpenHarmony 设备, 主要面向**无触摸/触摸失效**的场景 (例如 RK3568 OH3.2 Banner 桌面), 通过 D-pad 焦点选择桌面图标。
-
-| 主机按键 | 设备动作 | 注入路径 |
-|----------|----------|----------|
-| F1 | 主页 | `uitest keyEvent Home` |
-| F2 / Esc | 返回 | `uitest keyEvent Back` |
-| F3 | 音量+ | `uitest keyEvent VolumeUp` |
-| F4 | 音量- | `uitest keyEvent VolumeDown` |
-| F5 | 电源 | `uitest keyEvent Power` |
-| F6 | 相机 | `uinput -K 19` |
-| **↑ / ↓ / ←/ →** | **D-pad 焦点移动 (桌面图标导航)** | `uinput -K 19/20/21/22` + 自动重复 |
-| Enter / KP_Enter | 确认 / 激活 | `uinput -K 66` |
-| Space / Tab | 空格 / 焦点切换 | `uinput -K 62 / 61` |
-| BackSpace | 删除 | `uinput -K 67` |
-| Home / End | 列表首/尾 | `uinput -K` |
-| PageUp / PageDown | 上/下一页 | `uinput -K` |
-| A-Z / 0-9 | 文本输入 | `uinput -K 7-54` |
-
-**注意**:
-- D-pad (方向键) 按住会自动重复 (280ms 延迟 + 80ms 间隔), 用于快速跳到远处图标
-- Home / Back / Power 走 `uitest uiInput keyEvent`, 这是 RK3568 OH3.2 上验证过的最稳定路径
-- 其它键走 `uinput -K`, 会自动 down/up 配对 (避免 RK3568 input service 丢弃 0ms 间隔事件)
-
-## 配置说明
-
-### 视频流配置
-   程序默认使用以下配置：
-- **分辨率**：设备原始分辨率
-- **帧率**：30 fps
-- **码率**：1.5 Mbps
-- **编码格式**：H.265/H.264
-
-### 网络配置
-- **默认端口**：27183
-- **心跳间隔**：1秒
-- **心跳超时**：5秒
-
-## 日志系统
-
-### 客户端日志配置
-- **配置文件**：`config/log_config.json`
-- **默认启用**：`log_to_file=true`（自动记录日志到文件）
-- **日志位置**：`logs/client_YYYYMMDD_HHMMSS.log`（根目录下logs子目录）
-- **双输出模式**：控制台输出（简化格式）+ 文件记录（完整格式）
-
-**配置文件字段说明**：
-```json
-{
-  "log_level": "INFO",         // 日志级别：DEBUG/INFO/WARN/ERROR/FATAL
-  "log_to_file": true,         // 是否启用日志文件记录
-  "log_dir": "logs",           // 日志目录（相对于可执行文件所在目录）
-  "log_file": null,            // 日志文件名（null表示自动生成）
-  "max_log_size_mb": 10,       // 最大日志文件大小（MB）
-  "backup_count": 5            // 备份日志文件数量
-}
+git clone <repo> ohscrcpy
+cd ohscrcpy
 ```
 
-### 服务端日志拉取
+### 2. 创建虚拟环境 + 装依赖
 
-服务端日志位于设备端`/data/local/tmp/`目录，可通过日志管理脚本拉取到本地。
-
-#### 获取服务端PID
-客户端启动服务端后会自动输出PID：
-```
-[INFO][服务端管理器] 服务正在运行，PID: 12345
-```
-
-#### 拉取日志命令
-
-**Linux/Mac**：
+**Linux / macOS**:
 ```bash
-./fetch_fetch_and_delete_server_logs.sh 12345  # 精确拉取
-./fetch_fetch_and_delete_server_logs.sh        # 批量拉取
+python3 -m venv venv312
+source venv312/bin/activate
+pip install -r requirements.txt
 ```
 
-**Windows**：
-```cmd
-fetch_fetch_and_delete_server_logs.bat 12345   # 精确拉取
-fetch_fetch_and_delete_server_logs.bat         # 批量拉取
+**Windows**(PowerShell):
+```powershell
+python -m venv venv312
+.\venv312\Scripts\Activate.ps1
+pip install -r requirements.txt
 ```
 
-**说明**：
-- 拉取后日志保存在本地`logs/`目录
-- 不删除设备上的日志文件
-- 脚本优先使用内置hdc，其次使用系统PATH中的hdc
+### 3. 启动
 
-### 日志清理
-
-**Linux/Mac**：
+**Linux**:
 ```bash
-./delete_fetch_and_delete_server_logs.sh 12345  # 精确删除（无需确认）
-./delete_fetch_and_delete_server_logs.sh        # 批量删除（需确认）
+./run_linux.sh
 ```
 
-**Windows**：
-```cmd
-delete_fetch_and_delete_server_logs.bat 12345   # 精确删除（无需确认）
-delete_fetch_and_delete_server_logs.bat         # 批量删除（需确认）
+**macOS**:
+```bash
+./run_macos.command
+# 或命令行
+bash run_macos.command
 ```
 
-**注意**：删除前请确保服务端进程已停止。
+**Windows**:
+- 双击 `run_windows.bat`
+- 或命令行:`run_windows.bat`
 
-## 故障排除
+启动脚本会自动:
+1. 检测平台 + 选 hdc 二进制
+2. 设置 PATH / DYLD_LIBRARY_PATH(macOS 需要 libusb)
+3. 单实例保护(旧实例自动关闭)
+4. 设置 MJPEG 模式(绕过 RK3568 HEVC bug)
+5. 启动 1.5 秒品牌启动画面(Splash)
 
-### 常见问题
+### 4. 自动化测试
 
-#### 1. 无法发现设备
-- 检查USB连接是否正常
-- 确保设备已启用USB调试模式
-- 尝试重新插拔USB线缆
-- 运行 `hdc list targets` 检查设备识别情况
+```bash
+bash tests/run_all.sh
+```
 
-#### 2. 连接失败
-- 工具安装路径不能有中文，hdc工具不支持中文路径
-- 检查默认端口`27183`是否被占用
-- 确保设备端服务端程序已运行
-- 检查防火墙设置
+跑全部 14 个测试套件(Pillow + PillBadge + UI回归 + 集成 + 跨平台 + 品牌)。
 
-#### 3. 服务端启动失败
-- 非root版本，无法安装和运行服务端程序
-- 服务端闪退，可执行文件和当前OpenHarmony系统不配套，需要重新源码编译
-- 服务端启动报错，基本上是编码器配置不匹配，需要查看服务端日志，分析确认具体不匹配的配置参数，然后修改参数并重新编译
+## 🔧 跨平台架构
 
-#### 4. 视频卡顿
-- 降低视频分辨率设置
-- 检查网络连接质量
-- 关闭不必要的后台程序
+```
+ohscrcpy/
+├── core/
+│   ├── platform_utils.py    # ← 跨平台核心 (detect_platform / get_hdc_path / setup_environment)
+│   ├── hdc_executor.py      # hdc 命令执行器 (自动 fallback 到 platform_utils)
+│   ├── mjpeg_server_manager.py
+│   └── ...
+├── gui/
+│   ├── branding.py          # ← 品牌系统 (Logo / Splash / StatusDot / 渐变)
+│   ├── widgets.py           # PillBadge (淡入淡出) + ModernButton + PhoneFrame
+│   ├── main_window.py       # 主窗口 (含 SplashScreen 集成)
+│   └── ...
+├── hdc/                     # hdc 二进制 (Linux/Darwin/Windows × x64/arm64)
+├── run_linux.sh             # Linux 启动器
+├── run_macos.command        # macOS 启动器 (双击即用)
+├── run_windows.bat          # Windows 启动器 (双击即用)
+└── tests/                   # 自动化测试
+```
 
-#### 5. 解码错误
-- 确保已安装所有Python依赖
-- 检查`PyAV`库是否正确安装
-- 尝试重启程序
+`core/platform_utils.py` 提供跨平台抽象:
 
-### 调试模式
-   启用客户端调试模式获取详细信息：
 ```python
-self.video_client = VideoStreamClient(on_frame_decoded=self._on_frame_decoded, debug=True)
+from core.platform_utils import (
+    detect_platform,  # 'linux' / 'darwin' / 'windows'
+    detect_arch,      # 'x64' / 'arm64' / 'arm'
+    get_hdc_path,     # 自动选 hdc/Linux/x64/hdc 等
+    setup_environment,  # 设 PATH / DYLD_LIBRARY_PATH
+    print_platform_banner,  # 启动横幅
+)
 ```
 
-## 安全注意事项
-   1. **权限管理**：仅在授权的情况下访问设备
-   2. **数据安全**：视频流仅在本地网络传输
-   3. **隐私保护**：不记录或传输敏感信息
+### Windows 平台特殊说明
 
-## 免责声明
-   本工具仅供学习和研究使用，请勿用于非法用途。使用本工具造成的任何后果，开发者概不负责。
+- **hdc 路径**:`hdc\Windows\x64\hdc.exe`(项目自带)
+- **libusb**:`hdc\Windows\x64\libusb_shared.dll`(项目自带)
+- **PATH**:`run_windows.bat` 自动把 hdc 目录加入 PATH
+- **hdc stdio**:Windows 上 hdc 偶尔有 stderr 噪音,不影响功能
 
----
+### macOS 平台特殊说明
+
+- **DYLD_LIBRARY_PATH**:必须设置才能找到 `libusb_shared.dylib`
+- **Gatekeeper**:首次运行可能需要 `右键 → 打开` 绕过未签名警告
+- **Apple Silicon (M1/M2)**:目前用 x64 版本(Rosetta 兼容),arm64 native 待支持
+
+## 🎨 UI 品牌系统
+
+`gui/branding.py` 提供:
+
+- `BrandColor`:科技感蓝青配色(`#0ea5e9` / `#06b6d4` / `#22c55e` / `#ef4444`)
+- `Logo`:Canvas 自绘矢量 logo(手机 + 投屏波纹)
+- `SplashScreen`:1.5 秒渐显启动画面
+- `StatusDot`:连接状态动画(connecting 旋转 / connected 脉冲 / error 闪烁)
+- `interpolate_color`:渐变色插值工具
+
+## ⌨️ 键盘快捷键
+
+| 键 | 动作 |
+|---|---|
+| F1 | 主页 |
+| F2 | 返回 |
+| F3 / F4 | 音量 + / - |
+| F5 | 电源键 |
+| F6 | 截屏保存 |
+| F8 | 切换 OSD 显示 (FPS/帧数/尺寸) |
+| F9 | 强制 GC |
+| F12 | 开关 键盘映射 |
+| Shift+F8 | 调试窗口 |
+| D-pad | 桌面图标选择 |
+| 字母数字 | 字符输入 |
+
+## ⚙️ 环境变量
+
+| 变量 | 默认 | 含义 |
+|---|---|---|
+| `OHCRCPY_MJPEG_MODE` | 1 | MJPEG 模式开关(绕过 RK3568 HEVC bug) |
+| `OHCRCPY_MJPEG_WIDTH` | 1080 | 截图宽度 |
+| `OHCRCPY_MJPEG_HEIGHT` | 1920 | 截图高度 |
+| `OHCRCPY_MJPEG_PORT` | 27190 | MJPEG 服务端口 |
+| `OHCRCPY_NO_SPLASH` | (unset) | 设为 1 跳过启动画面(单元测试用) |
+| `DCEPR_HDC` | (unset) | 自定义 hdc 路径 |
+
+## 🐛 故障排查
+
+| 问题 | 解决 |
+|---|---|
+| 黑屏但日志显示 render 成功 | RDP 用户:加宽窗口(标题栏顶端光带消失即被 dock 遮挡) |
+| 鼠标点击无反应 | 检查设备是否解锁,uitest daemon 是否启动 |
+| hdc 未找到 | `ls hdc/<platform>/<arch>/` 应该有 hdc 二进制 |
+| macOS `Library not loaded` | 检查 `hdc/Darwin/x64/libusb_shared.dylib` 是否存在 |
+| Windows 启动闪退 | 启用虚拟环境:`venv312\Scripts\activate` |
+
+## 📝 更新日志
+
+### v2.3.x (跨平台 + UI 美化)
+- ✅ 跨平台骨架: `core/platform_utils.py` + 三平台启动脚本
+- ✅ 品牌 UI: Splash 启动画面 + Logo + StatusDot 动画
+- ✅ PillBadge 淡入淡出
+- ✅ 标题栏顶部光带
+- ✅ 自适应窗口(RDP / 普通桌面 / 全屏)
+- ✅ Click/key 路径优化(540ms → 220ms)
+- ✅ MJPEG 服务稳定化(busybox httpd 监听重试)
+- ✅ 单实例保护
+
+### 详见 `logs/` 下的运行日志
+
+## 📜 License
+
+Apache License 2.0

@@ -264,14 +264,31 @@ class PillBadge:
     用法:
         badge = PillBadge(video_canvas)
         badge.set_text("FPS 28 • 1080x1920")  # 更新内容
-        badge.set_visible(False)             # 隐藏 (F8)
+        badge.set_visible(False)             # 隐藏 (F8, 淡出)
+        badge.fade_in()                       # 淡入显示 (300ms)
+
+    动画:
+        - 淡入: 6 帧 * 50ms 调整 fill 颜色亮度从 30% -> 100%
+        - 淡出: 6 帧 * 50ms 调整 fill 颜色亮度从 100% -> 30%, 然后删除
+        - Tk canvas 不支持 alpha, 通过调整 fill 颜色模拟 (深 -> 浅)
     """
+    FADE_STEPS = 6
+    FADE_MS = 50
+
     def __init__(self, canvas: tk.Canvas) -> None:
         self._canvas = canvas
         self._item_bg: Optional[int] = None
         self._item_text: Optional[int] = None
         self._visible = True
         self._text = ""
+        self._fade_after_id: Optional[str] = None
+        self._fade_step: int = 0
+        self._fade_dir: int = 0  # 0=静止, 1=淡入, -1=淡出
+
+    def _interp_color(self, c1: str, c2: str, t: float) -> str:
+        """HSL 风格简化: 线性 RGB 插值."""
+        from gui.branding import interpolate_color
+        return interpolate_color(c1, c2, t)
 
     def _draw(self) -> None:
         self._canvas.delete("pill_badge")
@@ -316,17 +333,89 @@ class PillBadge:
         self._canvas.tag_raise(self._item_bg)
         if self._item_text:
             self._canvas.tag_raise(self._item_text)
+        # 如果有未完成的淡入/淡出动画, 重启 (新的 text 重置动画)
+        if self._fade_dir != 0:
+            self._cancel_fade()
+            self._start_fade(self._fade_dir)
+
+    def _cancel_fade(self) -> None:
+        if self._fade_after_id:
+            try:
+                self._canvas.after_cancel(self._fade_after_id)
+            except Exception:
+                pass
+            self._fade_after_id = None
+
+    def _start_fade(self, direction: int) -> None:
+        """direction: 1=淡入, -1=淡出."""
+        self._cancel_fade()
+        self._fade_dir = direction
+        self._fade_step = 0
+        self._tick_fade()
+
+    def _tick_fade(self) -> None:
+        self._fade_step += 1
+        t = self._fade_step / self.FADE_STEPS
+        if self._fade_dir == 1:
+            # 淡入: 深 -> 标准 PILL_BG
+            color = self._interp_color("#020617", Theme.PILL_BG, t)
+        else:
+            # 淡出: 标准 -> 深
+            color = self._interp_color(Theme.PILL_BG, "#020617", t)
+
+        if self._item_bg is not None:
+            try:
+                self._canvas.itemconfig(self._item_bg, fill=color)
+            except Exception:
+                pass
+        # 文字: 跟着变浅 (白 -> 灰)
+        if self._item_text is not None:
+            try:
+                if self._fade_dir == 1:
+                    text_color = self._interp_color("#475569", Theme.TEXT_PRIMARY, t)
+                else:
+                    text_color = self._interp_color(Theme.TEXT_PRIMARY, "#475569", t)
+                self._canvas.itemconfig(self._item_text, fill=text_color)
+            except Exception:
+                pass
+
+        if self._fade_step < self.FADE_STEPS:
+            self._fade_after_id = self._canvas.after(self.FADE_MS, self._tick_fade)
+        else:
+            self._fade_after_id = None
+            # 淡出完成: 删除
+            if self._fade_dir == -1:
+                self._canvas.delete("pill_badge")
+                self._item_bg = None
+                self._item_text = None
+            self._fade_dir = 0
 
     def set_text(self, text: str) -> None:
         self._text = text
-        self._draw()
+        # 如果当前可见, 重画并触发"重新淡入"(视觉反馈)
+        if self._visible:
+            self._draw()
 
     def set_visible(self, visible: bool) -> None:
+        """直接显示/隐藏 (不带动画)."""
+        self._cancel_fade()
         self._visible = visible
         self._draw()
         if not visible:
             self._item_bg = None
             self._item_text = None
+
+    def fade_in(self) -> None:
+        """淡入显示 (300ms, 替换硬显示, 用于 show after delay)."""
+        self._visible = True
+        self._draw()
+        self._start_fade(1)
+
+    def fade_out(self) -> None:
+        """淡出隐藏 (300ms, 替换硬隐藏, 用于 hide)."""
+        if self._item_bg is None and self._item_text is None:
+            return
+        self._start_fade(-1)
 
 
 # ─────────────────────────────────────────────

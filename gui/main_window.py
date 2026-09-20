@@ -47,6 +47,7 @@ from video import VideoStreamClient
 from gui.device_panel import DevicePanel
 from gui.control_panel import ControlPanel, InfoPanel
 from gui.video_panel import VideoPanel
+from gui.branding import BrandColor, Logo, StatusDot, SplashScreen
 from gui.keyboard_mapper import KeyboardMapper
 from gui.device_controller import DeviceController
 from gui.connection_manager import ConnectionManager, ConnectionState
@@ -158,11 +159,13 @@ class MainWindow:
         self._gui_queue: "_queue.Queue" = _queue.Queue()
         self._main_tid = threading.get_ident()
 
-        self._setup_ui()
+        # 跨平台品牌启动: 1.5 秒 Splash 后自动销毁
+        # Splash 必须在 _setup_ui 之前, 因为 _setup_ui 创建主窗口 widget
+        # 主窗口暂时隐藏, splash 关闭后显示
+        self._splash_done = False
+        self._show_splash_then_init_ui()  # 内部会调 _setup_ui + _init_components_async (同步顺序)
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
         self._bind_shortcuts()
-        
-        self._init_components_async()  # 现在内部转主线程
 
         # 启动 GUI queue pump (主线程)
         try:
@@ -172,6 +175,70 @@ class MainWindow:
 
         print_log(LogLevel.INFO, self.log_title, f"初始化完成")
     
+    def _show_splash_then_init_ui(self) -> None:
+        """显示启动画面, 完成后自动调用 _setup_ui.
+
+        品牌 Splash 1.5s 内显示 Logo + 加载动画, 然后:
+          1. 调用 _setup_ui 创建主界面
+          2. 显示主窗口
+
+        测试短路: 设环境变量 OHCRCPY_NO_SPLASH=1 跳过 Splash (单元测试用)
+        """
+        import os as _os
+        if _os.environ.get("OHCRCPY_NO_SPLASH") == "1":
+            # 测试模式: 立即 setup, 不显示 splash
+            try:
+                self._setup_ui()
+            except Exception as e:
+                from core import print_log, LogLevel
+                print_log(LogLevel.ERROR, self.log_title, f"GUI 初始化失败: {e}")
+                import traceback
+                traceback.print_exc()
+                return
+            # 测试模式: 也调一次 init_components (no splash 路径)
+            try:
+                self._init_components_async()
+            except Exception:
+                pass
+            return
+
+        # 主窗口先 withdraw (隐藏), 等 splash 完才显示
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+
+        def _on_splash_finish():
+            try:
+                self._setup_ui()
+            except Exception as e:
+                from core import print_log, LogLevel
+                print_log(LogLevel.ERROR, self.log_title, f"GUI 初始化失败: {e}")
+                import traceback
+                traceback.print_exc()
+                return
+            try:
+                self.root.deiconify()
+            except Exception:
+                pass
+            # [关键修复] 必须在 _setup_ui 完成后 (video_canvas 就绪) 才能 init components
+            # 否则 device_controller.bind_video_canvas 收到 None -> AttributeError
+            try:
+                self._init_components_async()
+            except Exception as e:
+                from core import print_log, LogLevel
+                print_log(LogLevel.ERROR, self.log_title, f"组件初始化失败: {e}")
+                import traceback
+                traceback.print_exc()
+
+        try:
+            SplashScreen(self.root, on_finish=_on_splash_finish)
+        except Exception as e:
+            from core import print_log, LogLevel
+            print_log(LogLevel.WARN, self.log_title,
+                f"SplashScreen 启动失败 (非致命), 直接进入主界面: {e}")
+            _on_splash_finish()
+
     def _setup_ui(self) -> None:
         """设置UI (现代扁平化重构版)"""
         # 根窗口背景
@@ -185,12 +252,18 @@ class MainWindow:
         self.root.update_idletasks()
 
     def _create_title_bar(self) -> None:
-        """现代扁平标题栏 (36px 高, 深色 Slate)."""
+        """现代扁平标题栏 (36px 高, 深色 Slate + 顶部光带)."""
         title_frame = tk.Frame(
             self.root, height=Theme.TITLE_BAR_HEIGHT, bg=Theme.BG_PANEL,
         )
         title_frame.pack(fill=tk.X)
         title_frame.pack_propagate(False)
+
+        # 顶部 2px 青色光带 (品牌高光)
+        title_glow = tk.Frame(
+            title_frame, height=2, bg=BrandColor.PRIMARY_LIGHT,
+        )
+        title_glow.pack(side=tk.TOP, fill=tk.X)
 
         # 左侧: 应用名
         left = tk.Frame(title_frame, bg=Theme.BG_PANEL)
@@ -1114,7 +1187,24 @@ class MainWindow:
             print_log(LogLevel.INFO, "GUI设备状态更新", f"{message}")
         except Exception:
             pass
-    
+        # 同步动画状态点 (StatusDot): 根据 message 关键词推断状态
+        try:
+            if hasattr(self, "status_dot") and self.status_dot is not None:
+                if message is None:
+                    new_state = "idle"
+                elif "失败" in message or "错误" in message:
+                    new_state = "error"
+                elif "成功" in message or "已连接" in message:
+                    new_state = "connected"
+                elif any(k in message for k in ("连接中", "正在", "扫描", "部署", "探测", "获取")):
+                    new_state = "connecting"
+                else:
+                    new_state = "idle"
+                if new_state != self.status_dot.state:
+                    self.status_dot.set_state(new_state)
+        except Exception:
+            pass
+
     def _on_closing(self) -> None:
         """关闭窗口"""
         if self.is_connected:

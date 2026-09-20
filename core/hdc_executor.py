@@ -18,6 +18,9 @@ OpenHarmony_Scrcpy HDC命令执行器
 """
 
 import sys
+import platform
+import subprocess
+from .platform_utils import get_hdc_path as _platform_get_hdc_path
 import os
 import platform
 import shutil
@@ -103,6 +106,14 @@ class HDCCommandExecutor:
         override = os.environ.get("DCEPR_HDC", "")
         if override and os.path.isfile(override):
             candidates.insert(0, os.path.abspath(override))
+
+        # 兜底: 用 platform_utils 再次尝试 (覆盖任何 path 解析差异)
+        plat_hdc = _platform_get_hdc_path(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        if plat_hdc and os.path.abspath(plat_hdc) not in [
+                os.path.abspath(c) for c in candidates]:
+            candidates.append(plat_hdc)
 
         for cand in candidates:
             try:
