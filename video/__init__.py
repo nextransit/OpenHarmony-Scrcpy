@@ -17,9 +17,10 @@
 OpenHarmony_Scrcpy 视频模块
 """
 
-from .config import VideoStreamConfig
+from .config import VideoStreamConfig, H264_STREAM_PORT
 from .decoder import VideoDecoder
 from .stream_client import VideoStreamClient
 from .mjpeg_client import MjpegStreamClient
+from .h264_client import H264StreamClient
 
-__all__ = ["VideoStreamConfig", "VideoDecoder", "VideoStreamClient", "MjpegStreamClient"]
+__all__ = ["VideoStreamConfig", "H264_STREAM_PORT", "VideoDecoder", "VideoStreamClient", "MjpegStreamClient", "H264StreamClient"]

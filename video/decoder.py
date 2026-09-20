@@ -275,6 +275,38 @@ class VideoDecoder:
             return False
         return not has_slice
 
+
+    def decode_block(self, block: bytes):
+        """解码一段含 start code 的 Annex-B 字节流 (SPS/PPS/IDR/P 混合).
+
+        直接交给 PyAV codec_ctx.parse() -> decode(), 让 FFmpeg 自己切 NAL、
+        消费 SPS/PPS 状态。适配 RK3568 H.264 硬编 streamer 的整 GOP 输出。
+        """
+        if not block or self.codec_ctx is None:
+            return []
+        import av
+        out = []
+        try:
+            packets = self.codec_ctx.parse(block)
+            for packet in packets:
+                if packet is None:
+                    continue
+                frames = self.codec_ctx.decode(packet)
+                for frame in frames:
+                    if isinstance(frame, av.VideoFrame):
+                        if self.is_first_frame:
+                            print_log(LogLevel.INFO, self.log_title,
+                                f"解码帧: {frame.width}x{frame.height}, format={frame.format.name if frame.format else '?'}")
+                            self.is_first_frame = False
+                        arr = frame.to_ndarray(format='rgb24')
+                        out.append(arr)
+                        self.frame_count += 1
+                        self.decode_success += 1
+        except Exception as e:
+            self.decode_failure += 1
+            print_log(LogLevel.WARN, self.log_title, f"decode_block 解析异常: {type(e).__name__}: {e}")
+        return out
+
     def decode_frame(self, frame_data: bytes, is_keyframe: bool = False):
         """解码视频帧"""
         if not frame_data or len(frame_data) == 0:

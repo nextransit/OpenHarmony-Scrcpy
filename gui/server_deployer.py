@@ -82,6 +82,19 @@ class ServerDeployer:
             ui_callback(lambda: self._report_finish(False, "设备选择失败"))
             return
         
+        # H.264 模式: 部署 oh264_streamer (NDK 编译的二进制, 见 docs/H264_NDK_BUILD.md)
+        if os.environ.get('OHCRCPY_CODEC', 'mjpeg').lower() == 'h264':
+            print_log(LogLevel.INFO, self.log_title, "[H264模式] 部署设备端 oh264_streamer")
+            ui_callback(lambda: update_running_status("[H264模式] 部署设备端 oh264_streamer..."))
+            from core.h264_server_manager import H264ServerManager
+            h264_mgr = H264ServerManager(self.hdc_executor)
+            if not h264_mgr.setup(env_override=True):
+                ui_callback(lambda: self._report_finish(False, "oh264_streamer 部署失败"))
+                return
+            self._server_manager = None
+            ui_callback(lambda: self._report_finish(True, "H.264 模式,oh264_streamer 已就绪"))
+            return
+
         # 修复:RK3568 HEVC bug 绕过 — MJPEG 模式下跳过 ohscrcpy_server 部署
         if os.environ.get('OHCRCPY_MJPEG_MODE', '') in ('1', 'true', 'yes'):
             print_log(LogLevel.INFO, self.log_title, "[MJPEG模式] 跳过 ohscrcpy_server 部署,改用设备端 busybox httpd")

@@ -26,7 +26,7 @@ from core import (
     HOST, HEARTBEAT_TIMEOUT, LogLevel, print_log,
     HDCCommandExecutor, DeviceManager,
 )
-from video import VideoStreamClient, MjpegStreamClient
+from video import VideoStreamClient, MjpegStreamClient, H264StreamClient
 
 
 class ConnectionState:
@@ -65,17 +65,34 @@ class ConnectionManager:
         self._init_video_client()
     
     def _init_video_client(self) -> None:
-        """初始化视频流客户端 (默认 HEVC; 通过环境变量 OHCRCPY_MJPEG_MODE=1 切换 MJPEG)"""
-        use_mjpeg = os.environ.get('OHCRCPY_MJPEG_MODE', '') in ('1', 'true', 'yes')
-        if use_mjpeg:
-            print_log(LogLevel.INFO, self.log_title, "检测到 OHCRCPY_MJPEG_MODE=1, 使用 MJPEG 模式 (绕过 RK3568 HEVC bug)")
+        """初始化视频流客户端.
+
+        codec 选择优先级 (由环境变量 OHCRCPY_CODEC 决定):
+          - mjpeg: MJPEG 模式 (绕过 RK3568 HEVC bug, 当前默认)
+          - h264:  H.264 模式 (需要设备端 oh264_streamer, 见 docs/H264_NDK_BUILD.md)
+          - h265:  HEVC 模式 (走原 VideoStreamClient, RK3568 上有马赛克 bug)
+        OHCRCPY_CODEC 未设时, 默认 mjpeg (向后兼容).
+        """
+        codec = os.environ.get('OHCRCPY_CODEC', 'mjpeg').lower()
+        if codec == 'h264':
+            from video.config import H264_STREAM_PORT
+            print_log(LogLevel.INFO, self.log_title, "检测到 OHCRCPY_CODEC=h264, 使用 H.264 模式")
+            self.video_client = H264StreamClient(
+                host='127.0.0.1',
+                port=int(os.environ.get('OHCRCPY_H264_PORT', str(H264_STREAM_PORT))),
+                on_frame_decoded=self.on_frame_decoded,
+                debug=self.debug,
+            )
+        elif codec == 'mjpeg':
+            print_log(LogLevel.INFO, self.log_title, "检测到 OHCRCPY_CODEC=mjpeg (默认), 使用 MJPEG 模式 (绕过 RK3568 HEVC bug)")
             self.video_client = MjpegStreamClient(
                 host='127.0.0.1',
                 port=int(os.environ.get('OHCRCPY_MJPEG_PORT', '27190')),
                 on_frame_decoded=self.on_frame_decoded,
                 debug=self.debug,
             )
-        else:
+        else:  # h265 / hevc / 默认
+            print_log(LogLevel.INFO, self.log_title, f"使用 HEVC 模式 (codec={codec})")
             self.video_client = VideoStreamClient(
                 device_manager=self.device_manager,
                 on_frame_decoded=self.on_frame_decoded,

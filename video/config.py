@@ -20,14 +20,19 @@ OpenHarmony_Scrcpy 视频流配置
 from dataclasses import dataclass
 
 
-@dataclass  
+@dataclass
 class VideoStreamConfig:
     """视频流配置"""
     width: int = 720
     height: int = 1280
     fps: int = 30
     bitrate: int = 1500000
-    codec: str = "h264"
+    codec: str = "h264"  # h264 / h265 / mjpeg (由 OHCRCPY_CODEC 决定)
 
 
-__all__ = ["VideoStreamConfig"]
+# H.264 流端口 (设备端 oh264_streamer 默认监听端口).
+# 端口独立于 MJPEG/H.265, 避免冲突. 选择 27191 是为了与 MJPEG (27190) 相邻便于排查.
+H264_STREAM_PORT = 27191
+
+
+__all__ = ["VideoStreamConfig", "H264_STREAM_PORT"]
