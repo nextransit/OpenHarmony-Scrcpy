@@ -376,6 +376,9 @@ class SplashScreen:
             bg=BrandColor.BG_DEEP, highlightthickness=0, bd=0,
         )
         self.canvas.pack(fill="both", expand=True)
+        # 关键: pack 之后立即调 winfo_width() 还是 1 (canvas 未布局).
+        # 强制 update_idletasks 让 canvas 拿到真实尺寸 (420x280).
+        self.top.update_idletasks()
         # 绘制
         self._items: List[int] = []
         self._draw()
@@ -393,10 +396,13 @@ class SplashScreen:
             steps=64, tag="splash_bg",
         )
         self._items.extend(items_bg)
-        # 2) Logo (居中偏上)
+        # 2) Logo + 标题 + 副标题 整体垂直居中 (按视觉块高度算偏移)
+        #    视觉块: logo 96 + 18 gap + title (~22pt 高) + 6 gap + sub (~11pt 高) ~= 155
+        #    splash h=280 -> 顶部 offset = (280 - 155 - 28(ring区)) / 2 ~= 48
+        block_top = (h - 155 - 32) // 2  # ring 区预留 32
         logo_size = 96
         logo_x = cx - logo_size // 2
-        logo_y = cy - 60
+        logo_y = block_top
         items_logo = Logo.draw(
             self.canvas, logo_x, logo_y, size=logo_size,
             phone_color=BrandColor.PRIMARY,
@@ -405,26 +411,28 @@ class SplashScreen:
             tag="splash_logo",
         )
         self._items.extend(items_logo)
-        # 3) 文字 "OHScrcpy" (粗体)
+        # 3) 文字 "OHScrcpy" (粗体, 在 logo 下方 18px)
+        title_y = logo_y + logo_size + 18 + 11   # +11: title baseline 居中到文字高
         items_title = [self.canvas.create_text(
-            cx, cy + 20, text="OHScrcpy",
+            cx, title_y, text="OHScrcpy",
             fill=BrandColor.TEXT_PRIMARY,
             font=("Microsoft YaHei", 22, "bold"),
             tag="splash_title",
         )]
         self._items.extend(items_title)
-        # 4) 副标题
+        # 4) 副标题 (在 title 下方 6px)
+        sub_y = title_y + 17
         items_sub = [self.canvas.create_text(
-            cx, cy + 50, text="OpenHarmony 投屏工具",
+            cx, sub_y, text="OpenHarmony 投屏工具",
             fill=BrandColor.TEXT_MUTED,
             font=("Microsoft YaHei", 11),
             tag="splash_sub",
         )]
         self._items.extend(items_sub)
-        # 5) 加载圆环 (底部, 旋转)
+        # 5) 加载圆环 (底部居中)
         self._ring_items: List[int] = []
         ring_r = 14
-        ring_y = h - 40
+        ring_y = h - 26
         # 8 段灰色圆环 + 1 段高亮
         n_seg = 12
         for i in range(n_seg):
@@ -449,7 +457,7 @@ class SplashScreen:
             h = self.canvas.winfo_height() or 280
             cx, cy = w // 2, h // 2
             ring_r = 14
-            ring_y = h - 40
+            ring_y = h - 26
             n_seg = 12
             offset = (self._step // 2) % n_seg
             for i in range(n_seg):

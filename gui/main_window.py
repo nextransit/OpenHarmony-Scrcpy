@@ -63,7 +63,7 @@ class MainWindow:
     
     def __init__(self) -> None:
         self.root = tk.Tk()
-        self.root.title(f"OHScrcpy - OpenHarmony投屏工具 {VERSION}    （作者: {AUTHOR}）")
+        self.root.title(f"OHScrcpy {VERSION}")
         # 自适应屏幕大小 (RDP/xorgxrdp 不支持 zoomed, 必须 fallback):
         # 1) 尝试 zoomed; 失败用屏幕 95% 计算尺寸
         try:
@@ -274,7 +274,7 @@ class MainWindow:
             font=Theme.FONT_TITLE, fg=Theme.ACCENT, bg=Theme.BG_PANEL,
         ).pack(side=tk.LEFT, padx=(0, 6))
         tk.Label(
-            left, text=f"OpenHarmony 投屏  •  v{VERSION}",
+            left, text=f"OpenHarmony 投屏  •  {VERSION}",
             font=Theme.FONT_SMALL, fg=Theme.TEXT_MUTED, bg=Theme.BG_PANEL,
         ).pack(side=tk.LEFT)
 

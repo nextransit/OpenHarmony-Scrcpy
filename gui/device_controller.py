@@ -17,6 +17,8 @@
 OpenHarmony_Scrcpy 设备控制器
 """
 
+import time
+
 import tkinter as tk
 from typing import Tuple, Optional, Any
 
@@ -93,10 +95,16 @@ class DeviceController:
     def bind_video_canvas(self, canvas: tk.Canvas) -> None:
         """绑定视频画布"""
         self.video_canvas = canvas
-        
+
         canvas.bind("<ButtonPress-1>", self._on_mouse_down)
         canvas.bind("<B1-Motion>", self._on_mouse_drag)
         canvas.bind("<ButtonRelease-1>", self._on_mouse_up)
+        # 鼠标滚轮 -> 设备 dpad up / down.
+        # macOS / Windows: event.delta (正值=向上滑动)
+        # Linux X11:      event.num (4=上, 5=下)
+        canvas.bind("<MouseWheel>", self._on_mouse_wheel)
+        canvas.bind("<Button-4>", self._on_mouse_wheel)
+        canvas.bind("<Button-5>", self._on_mouse_wheel)
     
     def reset(self) -> None:
         """重置控制器状态（切换设备时调用）"""
@@ -175,6 +183,38 @@ class DeviceController:
         device_y = int((window_y - top) / self.display_ratio)
         return device_x, device_y
     
+    def _on_mouse_wheel(self, event) -> None:
+        """鼠标滚轮 -> 设备 dpad up / down (滚动列表 / 桌面 / 长文时使用)."""
+        # 1) 解析方向
+        # macOS / Windows: event.delta (正值 = 滚轮远离用户, 内容向上滚动)
+        # Linux X11:       event.num (4 = 上, 5 = 下)
+        delta = 0
+        if event.num == 4:
+            delta = -1
+        elif event.num == 5:
+            delta = 1
+        else:
+            if event.delta > 0:
+                delta = -1
+            elif event.delta < 0:
+                delta = 1
+        if delta == 0:
+            return
+        # 2) 仅在已连接 (display 初始化完成) 时转发
+        if self.display_width <= 0 or self.display_height <= 0:
+            return
+        # 3) 防抖: 50ms 内的同方向滚轮合并为一次按键, 防止设备端按死
+        now = time.time()
+        if getattr(self, "_last_wheel_time", 0.0) > 0 and (now - self._last_wheel_time) < 0.05:
+            if getattr(self, "_last_wheel_dir", 0) == delta:
+                return
+        self._last_wheel_time = now
+        self._last_wheel_dir = delta
+        key_name = "dpad_up" if delta < 0 else "dpad_down"
+        print_log(LogLevel.DEBUG, self.log_title,
+            f"鼠标滚轮 -> {key_name} (delta={event.delta}, num={event.num})")
+        self.send_key(key_name)
+
     def _on_mouse_down(self, event: tk.Event) -> None:
         """鼠标按下"""
         # 修复:即使 device_controller 还没初始化完成,也要记录点击,
