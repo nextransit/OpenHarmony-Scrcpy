@@ -64,51 +64,19 @@ class MainWindow:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title(f"OHScrcpy {VERSION}")
-        # 自适应屏幕大小 (RDP/xorgxrdp 不支持 zoomed, 必须 fallback):
-        # 1) 尝试 zoomed; 失败用屏幕 95% 计算尺寸
+        # 关键: tk.Tk() 一旦创建 root, OS 会立刻渲染它 (空窗口, 默认 300x200).
+        # 立刻 withdraw 让 OS 不渲染空主窗口.
+        # 同时, 把所有 zoomed / geometry / 自适应窗口尺寸 计算 全部延后到
+        # _on_splash_finish() 之后 (那时候主窗口还没 visible, 但 geometry 已经计算好,
+        # _setup_ui() 创建的 widget 拿到的尺寸已经是 1100x800 这种最终尺寸).
+        # 这样 splash 显示期间 root 完全 hidden, 用户看不到空白主窗口一闪.
         try:
-            self.root.state("zoomed")
-            self.root.update_idletasks()
-        except tk.TclError:
+            self.root.withdraw()
+        except Exception:
             pass
-        try:
-            screen_w = self.root.winfo_screenwidth()
-            screen_h = self.root.winfo_screenheight()
-            cur_w = self.root.winfo_width()
-            cur_h = self.root.winfo_height()
-            # WM 边框 + 标题栏 + 任务栏预留 (RDP/xrdp 上不能 zoomed, 必须手动算)
-            # 实测: WM 给窗口加 ~41px (标题栏 30 + 上下边框 0) 总高度
-            # 设 client_h=879 时, WM 总高度=920, 位置 y=74 -> 总 y=994, 超出 949 底部 45px
-            # 因此 client_h 必须 <= screen_h - WM_reserve_top - WM_reserve_bottom - WM_decoration
-            # 实测: WM_RESERVE_TOP=30 (顶部 panel), WM_RESERVE_BOTTOM=40 (底部 dock 留空),
-            #       WM_decoration=41 (标题栏 + 边框). 总开销 = 30+40+41=111
-            WM_RESERVE_TOP = 30
-            WM_RESERVE_BOTTOM = 40
-            WM_DECORATION_H = 41  # 标题栏 30 + 上下边框 0 + 边框 0 (xrdp 实际)
-            WM_DECORATION_W = 4   # 左右边框 2px each
-            avail_h = screen_h - WM_RESERVE_TOP - WM_RESERVE_BOTTOM - WM_DECORATION_H
-            avail_w = screen_w - WM_DECORATION_W * 2
-            # 最小窗口要求: 放下设备缩放后的视频区 + 标题栏 36 + 右侧 toolbar 84 + padding
-            MIN_W, MIN_H = 1100, 800
-            # 取可用空间和 min 的较大值, 但不能超出可用空间
-            win_w = max(MIN_W, int(avail_w * 0.95))
-            win_h = max(MIN_H, int(avail_h * 0.95))
-            win_w = min(win_w, avail_w)
-            win_h = min(win_h, avail_h)
-            if cur_w < win_w * 0.95 or cur_h < win_h * 0.95 or cur_w < MIN_W or cur_h < MIN_H:
-                self.root.geometry(f"{win_w}x{win_h}")
-                print_log(LogLevel.INFO, "GUI",
-                    f"自适应窗口: {win_w}x{win_h} (屏幕 {screen_w}x{screen_h}, avail {avail_w}x{avail_h})")
-            else:
-                print_log(LogLevel.INFO, "GUI",
-                    f"窗口尺寸足够: {cur_w}x{cur_h} (屏幕 {screen_w}x{screen_h}, avail {avail_w}x{avail_h})")
-        except Exception as e:
-            print_log(LogLevel.WARN, "GUI", f"窗口尺寸自适应失败: {e}, 用默认 1450x900")
-            self.root.geometry("1450x900")
-        # 强制 update 让 canvas 立即拿到 max 尺寸
-        self.root.update_idletasks()
-        self.root.update()
         # 注意: 不设 minsize, 让自适应计算窗口尺寸
+        # 之前设 minsize(1100,920) 在 xrdp RDP 上, WM 强制最小 height=920,
+        # 导致 client=900 也被拉成 920, 加上 WM 装饰 + y=80 总高度超 949, 底部被截
         # 之前设 minsize(1100,920) 在 xrdp RDP 上, WM 强制最小 height=920,
         # 导致 client=900 也被拉成 920, 加上 WM 装饰 + y=80 总高度超 949, 底部被截
         # 提升窗口到最前 + focus (RDP/wayland 下有时窗口被 z-序压住)
@@ -202,13 +170,16 @@ class MainWindow:
                 pass
             return
 
-        # 主窗口先 withdraw (隐藏), 等 splash 完才显示
-        try:
-            self.root.withdraw()
-        except Exception:
-            pass
+        # 主窗口已经在 __init__ 顶部 withdraw 了, 这里不再重复
 
         def _on_splash_finish():
+            # 1) 先做窗口尺寸自适应 + zoomed (在 root 仍 withdrawn 时设置,
+            #    这样 _setup_ui 创建 widget 时拿到的尺寸是最终尺寸)
+            try:
+                self._apply_initial_geometry()
+            except Exception as e:
+                print_log(LogLevel.WARN, "GUI", f"窗口尺寸自适应失败: {e}")
+            # 2) 然后 _setup_ui 创建 widget
             try:
                 self._setup_ui()
             except Exception as e:
@@ -217,11 +188,15 @@ class MainWindow:
                 import traceback
                 traceback.print_exc()
                 return
+            # 3) 最后才 deiconify 显示 -> 用户只看到完整主窗口 (无白闪)
             try:
                 self.root.deiconify()
+                self.root.update_idletasks()
+                self.root.lift()
+                self.root.focus_force()
             except Exception:
                 pass
-            # [关键修复] 必须在 _setup_ui 完成后 (video_canvas 就绪) 才能 init components
+            # 4) [关键修复] 必须在 _setup_ui 完成后 (video_canvas 就绪) 才能 init components
             # 否则 device_controller.bind_video_canvas 收到 None -> AttributeError
             try:
                 self._init_components_async()
@@ -238,6 +213,41 @@ class MainWindow:
             print_log(LogLevel.WARN, self.log_title,
                 f"SplashScreen 启动失败 (非致命), 直接进入主界面: {e}")
             _on_splash_finish()
+
+    def _apply_initial_geometry(self) -> None:
+        """窗口尺寸自适应. 在 root 仍 withdrawn 时调用, _setup_ui 之前.
+
+        注意: 不要在这里调 state('zoomed') 或 root.deiconify/update_idletasks,
+        会导致 root 提前 visible -> 用户看到一闪空白主窗口 (在 splash 后).
+        _setup_ui 完成后, on_finish 会一次性 deiconify + lift.
+        """
+        try:
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            cur_w = self.root.winfo_width()
+            cur_h = self.root.winfo_height()
+            # WM 边框 + 标题栏 + 任务栏预留
+            WM_RESERVE_TOP = 30
+            WM_RESERVE_BOTTOM = 40
+            WM_DECORATION_H = 41
+            WM_DECORATION_W = 4
+            avail_h = screen_h - WM_RESERVE_TOP - WM_RESERVE_BOTTOM - WM_DECORATION_H
+            avail_w = screen_w - WM_DECORATION_W * 2
+            MIN_W, MIN_H = 1100, 800
+            win_w = max(MIN_W, int(avail_w * 0.95))
+            win_h = max(MIN_H, int(avail_h * 0.95))
+            win_w = min(win_w, avail_w)
+            win_h = min(win_h, avail_h)
+            if cur_w < win_w * 0.95 or cur_h < win_h * 0.95 or cur_w < MIN_W or cur_h < MIN_H:
+                self.root.geometry(f"{win_w}x{win_h}")
+                print_log(LogLevel.INFO, "GUI",
+                    f"自适应窗口: {win_w}x{win_h} (屏幕 {screen_w}x{screen_h}, avail {avail_w}x{avail_h})")
+            else:
+                print_log(LogLevel.INFO, "GUI",
+                    f"窗口尺寸足够: {cur_w}x{cur_h} (屏幕 {screen_w}x{screen_h}, avail {avail_w}x{avail_h})")
+        except Exception as e:
+            print_log(LogLevel.WARN, "GUI", f"窗口尺寸自适应失败: {e}, 用默认 1450x900")
+            self.root.geometry("1450x900")
 
     def _setup_ui(self) -> None:
         """设置UI (现代扁平化重构版)"""

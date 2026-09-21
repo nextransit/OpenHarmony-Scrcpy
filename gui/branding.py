@@ -476,11 +476,8 @@ class SplashScreen:
             self._finish()
 
     def _finish(self) -> None:
-        # 淡出
-        try:
-            self.top.attributes("-alpha", 0.0)
-        except Exception:
-            pass
+        # 关闭顺序: 先调 on_finish (创建主窗口 widget), 再 destroy splash.
+        # 避免在主窗口 widget 还没创建好之前 destroy splash -> 用户看到一闪黑底.
         if self.on_finish:
             try:
                 self.on_finish()

@@ -95,6 +95,8 @@ class DeviceController:
     def bind_video_canvas(self, canvas: tk.Canvas) -> None:
         """绑定视频画布"""
         self.video_canvas = canvas
+        # 缓存 root 引用, 用于 root 级 bind_all 兜底
+        self._root_widget = canvas.winfo_toplevel()
 
         canvas.bind("<ButtonPress-1>", self._on_mouse_down)
         canvas.bind("<B1-Motion>", self._on_mouse_drag)
@@ -105,6 +107,18 @@ class DeviceController:
         canvas.bind("<MouseWheel>", self._on_mouse_wheel)
         canvas.bind("<Button-4>", self._on_mouse_wheel)
         canvas.bind("<Button-5>", self._on_mouse_wheel)
+        # 兜底: macOS / Windows 上, <MouseWheel> 默认只发到 focused widget.
+        # 用户没先点击 canvas 时事件会丢失. 在 root 上 bind_all 兜底,
+        # handler 内检查鼠标坐标是否在 canvas 内.
+        root = self._root_widget
+        root.bind_all("<MouseWheel>", self._on_mouse_wheel_global, add="+")
+        root.bind_all("<Button-4>", self._on_mouse_wheel_global, add="+")
+        root.bind_all("<Button-5>", self._on_mouse_wheel_global, add="+")
+        # 让 canvas 自动 focus (用户点 canvas 后事件直达, 不需手动 focus)
+        try:
+            canvas.bind("<Enter>", lambda ev: canvas.focus_set(), add="+")
+        except Exception:
+            pass
     
     def reset(self) -> None:
         """重置控制器状态（切换设备时调用）"""
@@ -183,6 +197,29 @@ class DeviceController:
         device_y = int((window_y - top) / self.display_ratio)
         return device_x, device_y
     
+    def _on_mouse_wheel_global(self, event) -> None:
+        """root 级 bind_all 兜底: 只在鼠标在 video_canvas 内时才转发."""
+        if not self.video_canvas or not self._root_widget:
+            return
+        # 用 widget.winfo_containing(x, y) 判断鼠标所在的 widget 是否是 canvas.
+        try:
+            root = self._root_widget
+            x_root = root.winfo_pointerx()
+            y_root = root.winfo_pointery()
+            target = root.winfo_containing(x_root, y_root)
+            if target is None:
+                return
+            # winfo_containing 可能返回 canvas 的子项 (image, etc.),
+            # 向上找到 canvas
+            w = target
+            while w is not None and w is not self.video_canvas:
+                w = w.master
+            if w is None:
+                return  # 鼠标不在 canvas 内, 不抢焦点
+        except Exception:
+            return
+        self._on_mouse_wheel(event)
+
     def _on_mouse_wheel(self, event) -> None:
         """鼠标滚轮 -> 设备 dpad up / down (滚动列表 / 桌面 / 长文时使用)."""
         # 1) 解析方向
