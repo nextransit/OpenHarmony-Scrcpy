@@ -49,6 +49,24 @@ export OHCRCPY_MJPEG_MODE=${OHCRCPY_MJPEG_MODE:-1}
 export OHCRCPY_MJPEG_WIDTH=${OHCRCPY_MJPEG_WIDTH:-1080}
 export OHCRCPY_MJPEG_HEIGHT=${OHCRCPY_MJPEG_HEIGHT:-1920}
 
+# 关键修复: 启动前主动清理设备端残留的 ohscrcpy_server (HEVC 模式产物).
+# 如果设备端残留 ohscrcpy_server, 它会占用 27183 端口并响应 SCREEN_INFO banner,
+# 导致 mjpeg_client 在 27190 端口拿到错误 banner -> 黑屏.
+# 注: MjpegServerManager._stop_background 也会清, 这里提前一层以减少首次连接失败.
+HDC="${DIR}/hdc/Darwin/${HDC_ARCH_DIR}/hdc"
+if [ -x "$HDC" ]; then
+    export DYLD_LIBRARY_PATH="$DIR/hdc/Darwin/${HDC_ARCH_DIR}:${DYLD_LIBRARY_PATH:-}"
+    # 异步清理所有在线设备, 不阻塞 main.py 启动
+    # set +e 临时关闭: list targets 在没设备时返回非零 exit code
+    set +e
+    for dev_target in $("$HDC" list targets 2>/dev/null | grep -E "^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$"); do
+        "$HDC" -t "$dev_target" shell \
+            "pkill -9 -f ohscrcpy_server; pkill -9 -f busybox; pkill -9 -f snapshot_display" \
+            >/dev/null 2>&1 &
+    done
+    set -e
+fi
+
 # 单实例
 if pgrep -f "$PY.*main.py" > /dev/null; then
     echo "[run_macos] 检测到旧实例, 自动关闭..."

@@ -81,7 +81,18 @@ class MjpegServerManager:
         return self.hdc.execute(list(args), timeout=timeout)
     
     def _stop_background(self) -> None:
-        """清理后台进程"""
+        """清理后台进程
+
+        MJPEG 模式下, 如果设备端残留 ohscrcpy_server (HEVC 模式产物),
+        它会占用 27183 端口并响应 SCREEN_INFO banner,
+        导致 mjpeg_client 连 27190 失败或拿到错误 banner -> 黑屏.
+        """
+        # 关键: 杀掉设备端残留的 ohscrcpy_server (HEVC 模式产物),
+        # 释放 27183 端口并避免 banner 干扰 mjpeg_client.
+        try:
+            self._exec("shell", "pkill -9 -f ohscrcpy_server", timeout=3)
+        except Exception:
+            pass
         try:
             self._exec("shell", "pkill -9 -f snapshot_display", timeout=3)
         except Exception:
