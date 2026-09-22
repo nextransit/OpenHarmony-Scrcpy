@@ -11,7 +11,7 @@ from tkinter import ttk
 from typing import Callable, Optional, List
 
 from core import LogLevel, print_log
-from gui.theme import Theme
+from gui.theme import Theme, ICONS
 from gui.widgets import ModernButton
 
 
@@ -97,8 +97,8 @@ class DevicePanel:
         btn_refresh.pack(side=tk.LEFT, padx=(0, 6))
 
         self.connect_btn = ModernButton(
-            btn_frame, text="连接", command=self.on_connect,
-            style="success", width=68, height=32,
+            btn_frame, text="连接", icon=ICONS["connect"], command=self.on_connect,
+            style="success", width=88, height=32,
         )
         self.connect_btn._icon_only = False
         self.connect_btn._draw()
@@ -119,8 +119,21 @@ class DevicePanel:
         return self.device_var.get()
 
     def set_connect_button_state(self, text: str, bg_color: str) -> None:
-        """兼容旧 API."""
-        self.connect_btn.set_text(text)
+        """兼容旧 API. 自动切 icon + 文字 + 颜色:
+          未连接 (text='连接'): icon='⏵' style='success' (绿)
+          已连接 (text='断开'): icon='⏹' style='danger'  (红)
+        """
+        connected = '断开' in text
+        if connected:
+            self.connect_btn._icon = ICONS["disconnect"]
+            self.connect_btn._text = '断开'
+            self.connect_btn._style = 'danger'
+        else:
+            self.connect_btn._icon = ICONS["connect"]
+            self.connect_btn._text = '连接'
+            self.connect_btn._style = 'success'
+        self.connect_btn._current_colors = self.connect_btn._colors_for('normal')
+        self.connect_btn._draw()
 
     def get_frame(self) -> tk.LabelFrame:
         return self.frame

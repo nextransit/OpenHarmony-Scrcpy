@@ -47,7 +47,7 @@ from video import VideoStreamClient
 from gui.device_panel import DevicePanel
 from gui.control_panel import ControlPanel, InfoPanel
 from gui.video_panel import VideoPanel
-from gui.branding import BrandColor, Logo, StatusDot, SplashScreen
+from gui.branding import BrandColor, Logo, StatusDot, SplashScreen, load_app_icon
 from gui.keyboard_mapper import KeyboardMapper
 from gui.device_controller import DeviceController
 from gui.connection_manager import ConnectionManager, ConnectionState
@@ -63,6 +63,7 @@ class MainWindow:
     
     def __init__(self) -> None:
         self.root = tk.Tk()
+        self._app_icon_image = None
         self.root.title(f"OHScrcpy {VERSION}")
         # 关键: tk.Tk() 一旦创建 root, OS 会立刻渲染它 (空窗口, 默认 300x200).
         # 立刻 withdraw 让 OS 不渲染空主窗口.
@@ -72,6 +73,10 @@ class MainWindow:
         # 这样 splash 显示期间 root 完全 hidden, 用户看不到空白主窗口一闪.
         try:
             self.root.withdraw()
+        except Exception:
+            pass
+        try:
+            self._app_icon_image = load_app_icon(self.root)
         except Exception:
             pass
         # 注意: 不设 minsize, 让自适应计算窗口尺寸
@@ -116,6 +121,7 @@ class MainWindow:
         self.connection_manager: Optional[ConnectionManager] = None
         self.video_display: Optional[VideoDisplay] = None
         self.server_deployer: Optional[ServerDeployer] = None
+        self.mjpeg_server_manager: Optional[MjpegServerManager] = None
         
         self.device_status_label = None
         self.status_label = None
@@ -350,6 +356,7 @@ class MainWindow:
             'toggle_keyboard': self._toggle_keyboard_mapper,
         }
         self.control_panel = ControlPanel(right_container, callbacks)
+        self.control_panel.set_buttons_enabled(False)
 
     def _create_status_bar(self) -> None:
         """底部状态栏 (默认隐藏, F11 切换)."""
@@ -555,6 +562,8 @@ class MainWindow:
 
     def _do_init_in_main(self) -> None:
         """在主线程真实执行组件初始化 (GUI 操作)."""
+        from core import print_log, LogLevel
+        print_log(LogLevel.INFO, self.log_title, "_do_init_in_main 进入主线程")
         try:
             # 关键修复: 必须先在主线程创建 HDCCommandExecutor, 再传给 DeviceController.
             # 之前 self.hdc_executor = None 时传给 DeviceController, 导致 send_tap / _ensure_uitest_daemon
@@ -562,11 +571,18 @@ class MainWindow:
             # HDCCommandExecutor 构造只是常量赋值 + 找 hdc 路径, 无 GUI, 主线程创建安全.
             if self.hdc_executor is None:
                 self.hdc_executor = HDCCommandExecutor()
+                print_log(LogLevel.INFO, self.log_title, f"hdc_executor 已创建: {self.hdc_executor!r}")
 
             # device_controller 和 video_display 必须主线程创建
             if not hasattr(self, 'device_controller') or self.device_controller is None:
+                from core import print_log, LogLevel
+                print_log(LogLevel.INFO, self.log_title,
+                    f"创建 DeviceController 前: video_canvas={self.video_canvas!r} hdc_executor={self.hdc_executor!r}")
                 self.device_controller = DeviceController(self.hdc_executor)
+                print_log(LogLevel.INFO, self.log_title,
+                    f"DeviceController 已创建, 准备 bind_video_canvas")
                 self.device_controller.bind_video_canvas(self.video_canvas)
+                print_log(LogLevel.INFO, self.log_title, "bind_video_canvas 已调用")
 
             if not hasattr(self, 'keyboard_mapper') or self.keyboard_mapper is None:
                 self.keyboard_mapper = KeyboardMapper(self.hdc_executor, enabled=True)
@@ -649,15 +665,21 @@ class MainWindow:
     def _on_connection_state_changed(self, state: str) -> None:
         """连接状态变化回调"""
         self.is_connected = (state == ConnectionState.CONNECTED)
-        self.root.after(0, self._update_connection_ui)
+        self._defer_to_main(self._update_connection_ui)
     
     def _update_connection_ui(self) -> None:
         """更新连接相关UI"""
         if self.is_connected:
             self.device_panel.set_connect_button_state("断开", "#e74c3c")
+            if self.control_panel is not None:
+                self.control_panel.update_connect_button(True)
+                self.control_panel.set_buttons_enabled(True)
             self.connection_status_label.config(text="已连接", fg="#2ecc71")
         else:
             self.device_panel.set_connect_button_state("连接", "#2ecc71")
+            if self.control_panel is not None:
+                self.control_panel.update_connect_button(False)
+                self.control_panel.set_buttons_enabled(False)
             self.connection_status_label.config(text="未连接", fg="#e74c3c")
             self.performance_label.config(text="FPS: 0 | 帧数: 0")
     
@@ -774,6 +796,13 @@ class MainWindow:
         
         if not self.is_connected:
             if devices:
+                # 刷新只更新列表，不得在部署/连接进行中再次触发服务重启。
+                if self._get_server_deploy_state() != ServerDeployState.IDLE:
+                    self.device_panel.update_devices(display_names)
+                    self._update_device_status(f"发现 {len(devices)} 个设备（连接处理中）")
+                    print_log(LogLevel.DEBUG, self.log_title,
+                              "刷新设备: 部署或连接进行中, 跳过自动连接")
+                    return
                 self.device_panel.update_devices(display_names)
                 self._update_device_status(f"发现 {len(devices)} 个设备")
                 self._on_combobox_select(None)
@@ -821,11 +850,17 @@ class MainWindow:
     def _get_server_deploy_state(self) -> ServerDeployState:
         """获取服务部署状态"""
         with self.server_deploy_lock:
-            return self.server_deploy_state
+            state = self.server_deploy_state
+        return state if isinstance(state, ServerDeployState) else ServerDeployState.IDLE
     
     def _on_combobox_select(self, event: Optional[tk.Event]) -> None:
         """设备选择事件"""
         print_log(LogLevel.INFO, self.log_title, "-"*60)
+
+        if self._get_server_deploy_state() != ServerDeployState.IDLE:
+            print_log(LogLevel.DEBUG, self.log_title,
+                      "设备选择事件被忽略: 部署或连接正在进行")
+            return
         
         selected_device = self.device_panel.get_selected_device()
         print_log(LogLevel.INFO, self.log_title, f"用户选择设备: {selected_device}")
@@ -861,17 +896,31 @@ class MainWindow:
     
     def _on_server_deploy_finish(self, succ: bool, msg: str) -> None:
         """服务部署完成回调"""
+        self._set_server_deploy_state(
+            ServerDeployState.FINISHED if succ else ServerDeployState.IDLE
+        )
         self.connection_status_label.config(text="未连接", fg="#e74c3c")
         if not succ:
+            self.device_panel.set_connect_button_state("连接", "#2ecc71")
+            if self.control_panel is not None:
+                self.control_panel.update_connect_button(False)
             messagebox.showerror("错误", f"{msg}")
             return
         # 修复:RK3568 HEVC bug 绕过 — MJPEG 模式下部署完直接连接
         if os.environ.get('OHCRCPY_MJPEG_MODE', '') in ('1', 'true', 'yes'):
             print_log(LogLevel.INFO, self.log_title, "[MJPEG模式] server_deployer 完成,自动连接 MJPEG 服务")
             self._connect_device()
+        else:
+            self._set_server_deploy_state(ServerDeployState.IDLE)
     
     def _install_and_start_server_async(self) -> None:
         """异步安装并启动服务端"""
+        if self._get_server_deploy_state() != ServerDeployState.IDLE:
+            print_log(LogLevel.DEBUG, self.log_title,
+                      "忽略重复服务端部署请求")
+            return
+        self._set_server_deploy_state(ServerDeployState.INSTALLING)
+
         was_connected = self.is_connected
         
         # 切换设备时先断开旧连接
@@ -883,10 +932,14 @@ class MainWindow:
         selected = self.device_panel.get_selected_device()
         if not selected:
             print_log(LogLevel.WARN, self.log_title, f"用户选择设备为空")
+            self._set_server_deploy_state(ServerDeployState.IDLE)
             return
         
         self._show_waiting_screen()
-        self.device_panel.set_connect_button_state("连接", "#2ecc71")
+        self.device_panel.set_connect_button_state("连接中", "#e74c3c")
+        if self.control_panel is not None:
+            self.control_panel.set_connect_button_connecting()
+            self.control_panel.set_buttons_enabled(False)
         self.connection_status_label.config(text="未连接", fg="#e74c3c")
         self.performance_label.config(text="FPS: 0 | 帧数: 0")
         
@@ -894,14 +947,33 @@ class MainWindow:
             selected_device_name=selected,
             devices=self.device_manager.devices,
             update_running_status=self._update_running_status,
-            ui_callback=lambda f: self.root.after(0, f),
+            ui_callback=self._defer_to_main,
         )
     
     def _connect_device(self) -> None:
         """连接设备"""
+        state = self._get_server_deploy_state()
+        if state == ServerDeployState.INSTALLING:
+            print_log(LogLevel.DEBUG, self.log_title,
+                      "忽略连接请求: 服务端部署尚未完成")
+            return
+        if state == ServerDeployState.STARTING:
+            print_log(LogLevel.DEBUG, self.log_title,
+                      "忽略重复连接请求: 正在启动")
+            return
+        if self.is_connected or (
+            self.connection_manager is not None
+            and self.connection_manager.state == ConnectionState.CONNECTED
+        ):
+            print_log(LogLevel.DEBUG, self.log_title,
+                      "忽略重复连接请求: 已连接")
+            return
+        self._set_server_deploy_state(ServerDeployState.STARTING)
+
         selected = self.device_panel.get_selected_device()
         if not selected:
             messagebox.showwarning("警告", "请先选择设备")
+            self._set_server_deploy_state(ServerDeployState.IDLE)
             return
         
         target_device: Optional[Any] = None
@@ -912,40 +984,44 @@ class MainWindow:
         
         if not target_device or not self.device_manager.select_device(target_device.sn):
             self._update_device_status("设备选择失败")
+            self._set_server_deploy_state(ServerDeployState.IDLE)
             return
         
         def connect_device_async() -> None:
+            def _restore_connect_button():
+                self._set_server_deploy_state(ServerDeployState.IDLE)
+                self.device_panel.set_connect_button_state("连接", "#2ecc71")
+                if self.control_panel is not None:
+                    self.control_panel.update_connect_button(False)
+                    self.control_panel.set_buttons_enabled(False)
             port = self.device_manager.get_port_forwarding()
             if port == -1:
                 print_log(LogLevel.ERROR, self.log_title, f"获取可用转发端口失败")
-                self.device_panel.set_connect_button_state("连接", "#2ecc71")
+                self._defer_to_main(_restore_connect_button)
                 return
-            
-            # 修复:RK3568 HEVC 编码器 bug 绕过路径 - 通过环境变量 OHCRCPY_MJPEG_MODE=1 启用
+
             use_mjpeg = os.environ.get('OHCRCPY_MJPEG_MODE', '') in ('1', 'true', 'yes')
 
             if use_mjpeg:
-                # MJPEG 模式:无需部署 ohscrcpy_server,改为部署 busybox httpd + 截图循环
                 mjpeg_port = int(os.environ.get('OHCRCPY_MJPEG_PORT', '27190'))
                 print_log(LogLevel.INFO, self.log_title, f"[MJPEG模式] 部署设备端 MJPEG 服务 (port={mjpeg_port})")
                 mjpeg_mgr = MjpegServerManager(self.hdc_executor)
+                self.mjpeg_server_manager = mjpeg_mgr
                 if not mjpeg_mgr.setup(port=mjpeg_port, env_override=True, interval_s=0.15):
                     print_log(LogLevel.ERROR, self.log_title, "MJPEG 服务部署失败")
-                    self.device_panel.set_connect_button_state("连接", "#2ecc71")
+                    self._defer_to_main(_restore_connect_button)
                     return
-                # 注意:port 转发已在 MjpegServerManager.setup 内完成
             else:
-                # 原有 HEVC 路径
                 self.connection_manager.ensure_server_manager(target_device.manufacturer, self.hdc_executor)
 
                 if not self._install_and_start_server(port, self.connection_manager.get_server_manager()):
-                    self.device_panel.set_connect_button_state("连接", "#2ecc71")
+                    self._defer_to_main(_restore_connect_button)
                     return
 
                 print_log(LogLevel.INFO, self.log_title, f"设置端口转发...")
                 if not self.device_manager.setup_port_forwarding(port, port):
                     print_log(LogLevel.ERROR, self.log_title, f"端口转发失败，请尝试重新连接...")
-                    self.device_panel.set_connect_button_state("连接", "#2ecc71")
+                    self._defer_to_main(_restore_connect_button)
                     return
 
             try:
@@ -953,43 +1029,56 @@ class MainWindow:
                 self._update_device_status(f"正在连接设备: {device.sn}...")
 
                 print_log(LogLevel.DEBUG, self.log_title, f"连接视频流服务器...")
-                # MJPEG 模式连接本地 mjpeg 端口,HEVC 模式连接 server 转发端口
                 connect_port = int(os.environ.get('OHCRCPY_MJPEG_PORT', '27190')) if use_mjpeg else port
                 if self.connection_manager.connect(connect_port):
                     config = self.connection_manager.get_video_client().config
-                    self.is_connected = True
-                    self.device_panel.set_connect_button_state("断开", "#e74c3c")
-                    self.connection_status_label.config(text="已连接", fg="#2ecc71")
-                    self.device_status_label.config(text=f"设备: {device.sn}")
-                    
-                    self.video_display.displayed_frames = 0
-                    self.video_display.frame_counter = 0
-                    self.video_display.last_fps_time = time.time()
-                    self.video_display.last_print_frames = 0
-                    
-                    self.video_canvas.delete("all")
-                    self.video_canvas.config(bg="black")
-                    
-                    self._update_video_display()
-                    self._update_device_status(f"连接成功！分辨率: {config.width}x{config.height}")
+
+                    def _on_connect_success():
+                        self.is_connected = True
+                        self._set_server_deploy_state(ServerDeployState.IDLE)
+                        self.device_panel.set_connect_button_state("断开", "#e74c3c")
+                        if self.control_panel is not None:
+                            self.control_panel.update_connect_button(True)
+                            self.control_panel.set_buttons_enabled(True)
+                        self.connection_status_label.config(text="已连接", fg="#2ecc71")
+                        self.device_status_label.config(text=f"设备: {device.sn}")
+
+                        self.video_display.displayed_frames = 0
+                        self.video_display.frame_counter = 0
+                        self.video_display.last_fps_time = time.time()
+                        self.video_display.last_print_frames = 0
+
+                        self.video_canvas.delete("all")
+                        self.video_canvas.config(bg="black")
+
+                        self._update_device_status(f"连接成功！分辨率: {config.width}x{config.height}")
+                        self._update_video_display()
+
+                    self._defer_to_main(_on_connect_success)
                 else:
                     self._update_device_status("连接失败")
-                    self.device_panel.set_connect_button_state("连接", "#2ecc71")
-                    messagebox.showinfo("连接失败",
+                    self._defer_to_main(_restore_connect_button)
+                    self._defer_to_main(lambda: messagebox.showinfo("连接失败",
                         "无法连接到服务端！请检查:\n"
                         "1. 服务端是否在设备上运行\n"
-                        "2. 服务端口是否正确")
+                        "2. 服务端口是否正确"))
                     return
                 
             except Exception as e:
                 import traceback
                 self._update_device_status(f"连接失败: {str(e)}")
                 traceback.print_exc()
-                self._disconnect_device()
+                self._defer_to_main(lambda: (
+                    self._set_server_deploy_state(ServerDeployState.IDLE),
+                    self._disconnect_device()
+                ))
                 return
         
         threading.Thread(target=connect_device_async, daemon=True).start()
         self.device_panel.set_connect_button_state("连接中", "#e74c3c")
+        if self.control_panel is not None:
+            self.control_panel.set_connect_button_connecting()
+            self.control_panel.set_buttons_enabled(False)
     
     def _install_and_start_server(self, port: int, server_manager) -> bool:
         """安装并启动服务端"""
@@ -1022,6 +1111,14 @@ class MainWindow:
         """断开设备"""
         if self.connection_manager is not None:
             self.connection_manager.disconnect()
+
+        if self.mjpeg_server_manager is not None:
+            try:
+                self.mjpeg_server_manager.stop()
+            except Exception as e:
+                print_log(LogLevel.WARN, self.log_title, f"停止 MJPEG 服务失败: {e}")
+            finally:
+                self.mjpeg_server_manager = None
         
         if self.video_display is not None:
             self.video_display.reset()
@@ -1031,9 +1128,13 @@ class MainWindow:
         
         self._show_waiting_screen()
         self.device_panel.set_connect_button_state("连接", "#2ecc71")
+        if self.control_panel is not None:
+            self.control_panel.update_connect_button(False)
+            self.control_panel.set_buttons_enabled(False)
         self.connection_status_label.config(text="未连接", fg="#e74c3c")
         self.device_status_label.config(text="设备: 未连接")
         self.performance_label.config(text="FPS: 0 | 帧数: 0")
+        self._set_server_deploy_state(ServerDeployState.IDLE)
 
         if self.video_display is not None:
             self.video_display.force_garbage_collection()
@@ -1172,6 +1273,10 @@ class MainWindow:
     
     def _update_device_status(self, message: str) -> None:
         """更新状态 (同时同步到窗口标题栏)"""
+        # 子线程保护: config widget 必须在主线程
+        if hasattr(self, '_main_tid') and threading.get_ident() != self._main_tid:
+            self._defer_to_main(lambda: self._update_device_status(message))
+            return
         try:
             current = self.root.title()
             if " [" in current:
@@ -1181,13 +1286,6 @@ class MainWindow:
             self.root.title(f"{base} [{message}]")
         except Exception:
             pass
-        # 子线程保护: config widget 必须在主线程
-        if hasattr(self, '_main_tid') and threading.get_ident() != self._main_tid:
-            try:
-                self.root.after(0, lambda: self._update_device_status(message))
-                return
-            except Exception:
-                pass
         if hasattr(self, 'status_label') and self.status_label:
             try:
                 self.status_label.config(text=message)
@@ -1224,6 +1322,12 @@ class MainWindow:
         else:
             if self.video_client:
                 self.video_client.disconnect()
+            if self.mjpeg_server_manager:
+                try:
+                    self.mjpeg_server_manager.stop()
+                except Exception:
+                    pass
+                self.mjpeg_server_manager = None
             self.root.destroy()
     
     def run(self) -> None:

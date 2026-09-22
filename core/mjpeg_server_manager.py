@@ -19,6 +19,7 @@ class MjpegServerManager:
     DEFAULT_WIDTH = 1080
     DEFAULT_HEIGHT = 1920
     DEFAULT_INTERVAL_S = 0.15  # 截图间隔 (~6fps)
+    LOOP_PID_FILE = "/data/local/tmp/ohscrcpy_mjpeg_loop.pid"
     
     def __init__(self, hdc_executor: HDCCommandExecutor) -> None:
         self.hdc = hdc_executor
@@ -48,6 +49,7 @@ class MjpegServerManager:
             if env_w: width = int(env_w)
             if env_h: height = int(env_h)
             if env_port: port = int(env_port)
+        self.port = port
         self.width = width
         self.height = height
         self.interval = interval_s
@@ -87,6 +89,24 @@ class MjpegServerManager:
         它会占用 27183 端口并响应 SCREEN_INFO banner,
         导致 mjpeg_client 连 27190 失败或拿到错误 banner -> 黑屏.
         """
+        # 仅杀 snapshot_display 子进程不够: 外层 `sh -c while ...` 会在 sleep
+        # 结束后再次拉起它, 多个循环会同时覆盖 screen.jpeg, 造成断流/黑帧.
+        # 先按 PID 和唯一命令标记杀掉循环本身, 再清理旧版本遗留的子进程.
+        try:
+            self._exec(
+                "shell",
+                f"if [ -f {self.LOOP_PID_FILE} ]; then "
+                f"kill -9 $(cat {self.LOOP_PID_FILE}) 2>/dev/null; "
+                f"rm -f {self.LOOP_PID_FILE}; fi",
+                timeout=3,
+            )
+        except Exception:
+            pass
+        try:
+            # 兼容没有 PID 文件的旧循环; screen_new.jpeg 只出现在截图循环命令中.
+            self._exec("shell", "pkill -9 -f screen_new.jpeg", timeout=3)
+        except Exception:
+            pass
         # 关键: 杀掉设备端残留的 ohscrcpy_server (HEVC 模式产物),
         # 释放 27183 端口并避免 banner 干扰 mjpeg_client.
         try:
@@ -98,7 +118,11 @@ class MjpegServerManager:
         except Exception:
             pass
         try:
-            self._exec("shell", "pkill -9 busybox", timeout=3)
+            self._exec(
+                "shell",
+                f"pkill -9 -f 'busybox httpd.*-p {self.port}'",
+                timeout=3,
+            )
         except Exception:
             pass
     
@@ -160,7 +184,8 @@ class MjpegServerManager:
         interval_ms = int(self.interval * 1000)
         # 用 nohup + & 启动独立后台进程 (OHOS sh 不支持 setsid)
         sh_cmd = (
-            f"nohup sh -c 'while sleep {interval_ms/1000:.3f}; do "
+            f"nohup sh -c 'echo $$ > {self.LOOP_PID_FILE}; "
+            f"while sleep {interval_ms/1000:.3f}; do "
             f"snapshot_display -i 0 -w {self.width} -h {self.height} "
             f"-f /data/local/tmp/screen_new.jpeg > /dev/null 2>&1 && "
             f"mv /data/local/tmp/screen_new.jpeg /data/local/tmp/screen.jpeg; "

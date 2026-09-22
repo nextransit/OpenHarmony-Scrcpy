@@ -126,6 +126,13 @@ class ConnectionManager:
     
     def connect(self, port: int) -> bool:
         """同步连接设备（返回是否成功）"""
+        current_state = self.state
+        if current_state == ConnectionState.CONNECTED:
+            print_log(LogLevel.INFO, self.log_title, "已连接, 忽略重复连接请求")
+            return True
+        if current_state == ConnectionState.CONNECTING:
+            print_log(LogLevel.INFO, self.log_title, "正在连接, 忽略重复连接请求")
+            return False
         self._set_state(ConnectionState.CONNECTING)
         
         try:
@@ -145,6 +152,8 @@ class ConnectionManager:
     
     def disconnect(self) -> None:
         """断开连接"""
+        if self.state == ConnectionState.DISCONNECTED:
+            return
         self._set_state(ConnectionState.DISCONNECTING)
         
         if self.video_client:

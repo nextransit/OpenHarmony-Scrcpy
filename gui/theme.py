@@ -83,6 +83,7 @@ ICONS: Dict[str, str] = {
     "refresh": "↻",
     "connect": "⏵",
     "disconnect": "⏹",
+    "connecting": "⏳",
     "screenshot": "◉",
     "record": "●",
     "rotate": "↻",          # 与 refresh 重用

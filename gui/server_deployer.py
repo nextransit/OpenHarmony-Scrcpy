@@ -113,7 +113,7 @@ class ServerDeployer:
             ui_callback(lambda: self._report_finish(False, "获取可用转发端口失败！"))
             return
         
-        update_running_status(f"[预安装] 正在安装服务端，请稍等...")
+        ui_callback(lambda: update_running_status(f"[预安装] 正在安装服务端，请稍等..."))
         print_log(LogLevel.INFO, self.log_title, f"检查服务端安装状态...")
         if not self.device_manager.check_server_installed(self._server_manager):
             print_log(LogLevel.INFO, self.log_title, f"服务端未安装，开始安装...")
@@ -125,13 +125,13 @@ class ServerDeployer:
         else:
             print_log(LogLevel.INFO, self.log_title, f"服务端已安装")
         
-        update_running_status(f"[预安装] 正在启动服务端，请稍等...")
+        ui_callback(lambda: update_running_status(f"[预安装] 正在启动服务端，请稍等..."))
         print_log(LogLevel.INFO, self.log_title, f"检查服务端运行状态...")
         if not self.device_manager.check_server_running(self._server_manager):
             print_log(LogLevel.INFO, self.log_title, f"启动服务端...")
             if not self.device_manager.start_server(self._server_manager, port):
                 print_log(LogLevel.ERROR, self.log_title, f"服务端启动失败！")
-                update_running_status(f"[预安装] 启动服务端失败！")
+                ui_callback(lambda: update_running_status(f"[预安装] 启动服务端失败！"))
                 ui_callback(lambda: self._report_finish(False, "服务端启动失败！"))
                 return
             
@@ -140,7 +140,7 @@ class ServerDeployer:
         else:
             print_log(LogLevel.INFO, self.log_title, f"服务端已在运行")
         
-        update_running_status(f"[预安装] 服务端已就绪，可随时点击[连接]开始投屏！")
+        ui_callback(lambda: update_running_status(f"[预安装] 服务端已就绪，可随时点击[连接]开始投屏！"))
         ui_callback(lambda: self._report_finish(True, ""))
     
     def _report_finish(self, success: bool, message: str) -> None:

@@ -104,20 +104,40 @@ class ControlPanel:
         return self._buttons.get(name)
 
     def update_connect_button(self, connected: bool) -> None:
-        """更新连接按钮的图标/风格."""
+        """更新连接按钮: connected=True -> 断开图标(可点击), False -> 连接图标(可点击)."""
         btn = self._buttons.get('connect')
         if not btn:
             return
+        btn.set_disabled(False)
         if connected:
             btn.set_icon(ICONS["disconnect"])
-            btn.configure(bg=Theme.BG_PANEL)  # 这里实际上 ModernButton 不直接读 configure
-            # ModernButton 的颜色在 _current_colors 里, 通过替换 _style 来切换
-            btn._style = "danger"  # 切到 danger 色, 红色表示"断开"
-            btn._draw()
+            btn._style = "danger"
         else:
             btn.set_icon(ICONS["connect"])
             btn._style = "success"
-            btn._draw()
+        btn._current_colors = btn._colors_for("normal")
+        btn._draw()
+
+    def set_connect_button_connecting(self) -> None:
+        """连接中状态: 显示 connecting 图标, 禁用点击."""
+        btn = self._buttons.get('connect')
+        if not btn:
+            return
+        btn.set_icon(ICONS["connecting"])
+        btn._style = "secondary"
+        btn.set_disabled(True)
+
+    def set_buttons_enabled(self, enabled: bool) -> None:
+        """批量启用/禁用除连接按钮外的所有操作按钮.
+
+        未连接时: 操作按钮灰色不可点击.
+        已连接时: 操作按钮正常可点击.
+        """
+        skip = {'connect', 'refresh'}
+        for name, btn in self._buttons.items():
+            if name in skip:
+                continue
+            btn.set_disabled(not enabled)
 
 
 # 保留 InfoPanel 占位以兼容旧 import (但实际不再使用)
