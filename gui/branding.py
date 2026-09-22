@@ -20,6 +20,7 @@ OHScrcpy 品牌系统
 """
 import math
 import tkinter as tk
+from pathlib import Path
 from typing import Optional, Tuple, List
 
 
@@ -45,6 +46,28 @@ class BrandColor:
     BG_PANEL = "#0f172a"       # slate-900
     TEXT_PRIMARY = "#f1f5f9"   # slate-100
     TEXT_MUTED = "#94a3b8"     # slate-400
+
+
+def load_app_icon(root: tk.Tk) -> Optional[tk.PhotoImage]:
+    """加载仓库内的 PNG 图标并绑定到 Tk 根窗口.
+
+    Tk 需要保留 PhotoImage 引用，否则图标可能在函数返回后被回收。
+    macOS 的 Finder/Dock 图标仍由 assets/macos/OHScrcpy.icns 负责。
+    """
+    icon_path = (
+        Path(__file__).resolve().parent.parent
+        / "assets"
+        / "icons"
+        / "ohscrcpy-256.png"
+    )
+    if not icon_path.is_file():
+        return None
+    try:
+        image = tk.PhotoImage(file=str(icon_path))
+        root.iconphoto(True, image)
+        return image
+    except (OSError, tk.TclError):
+        return None
 
 
 # ── 颜色插值 (HSL 简单实现, 适合渐变条纹) ──
@@ -492,5 +515,5 @@ class SplashScreen:
 __all__ = [
     "BrandColor", "interpolate_color",
     "make_horizontal_gradient", "make_radial_glow",
-    "Logo", "StatusDot", "SplashScreen",
+    "Logo", "StatusDot", "SplashScreen", "load_app_icon",
 ]

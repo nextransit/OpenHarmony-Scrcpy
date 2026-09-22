@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="background" x1="112" y1="64" x2="912" y2="960" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1d4f86"/>
+      <stop offset="42%" stop-color="#112952"/>
+      <stop offset="1" stop-color="#050b1b"/>
+    </linearGradient>
+    <linearGradient id="backgroundSheen" x1="160" y1="120" x2="850" y2="820" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#61d9ff" stop-opacity="0.28"/>
+      <stop offset="48%" stop-color="#5c7cff" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#050b1b" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="deviceShell" x1="300" y1="162" x2="720" y2="866" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#b8f5ff"/>
+      <stop offset="24%" stop-color="#5ed8f3"/>
+      <stop offset="64%" stop-color="#218bd4"/>
+      <stop offset="1" stop-color="#1551a7"/>
+    </linearGradient>
+    <linearGradient id="deviceEdge" x1="326" y1="184" x2="708" y2="850" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f2fdff" stop-opacity="0.9"/>
+      <stop offset="42%" stop-color="#8eeaff" stop-opacity="0.36"/>
+      <stop offset="1" stop-color="#1350a4" stop-opacity="0.72"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="348" y1="230" x2="680" y2="790" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0a203d"/>
+      <stop offset="52%" stop-color="#07152b"/>
+      <stop offset="1" stop-color="#030913"/>
+    </linearGradient>
+    <linearGradient id="screenLight" x1="382" y1="718" x2="648" y2="278" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#23d7e9" stop-opacity="0.06"/>
+      <stop offset="42%" stop-color="#27d7f2" stop-opacity="0.56"/>
+      <stop offset="1" stop-color="#96a5ff" stop-opacity="0.12"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="410" y1="674" x2="638" y2="308" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#29e1f0"/>
+      <stop offset="54%" stop-color="#54b9ff"/>
+      <stop offset="1" stop-color="#9d8cff"/>
+    </linearGradient>
+    <radialGradient id="touchGlow" cx="0" cy="0" r="1" gradientTransform="translate(734 742) rotate(90) scale(130)">
+      <stop stop-color="#5ef4ff" stop-opacity="0.72"/>
+      <stop offset="46%" stop-color="#3cc9ff" stop-opacity="0.2"/>
+      <stop offset="1" stop-color="#3cc9ff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="22"/>
+      <feOffset dx="0" dy="24" result="offsetblur"/>
+      <feColorMatrix in="offsetblur" type="matrix"
+        values="0 0 0 0 0
+                0 0 0 0 0
+                0 0 0 0 0
+                0 0 0 0.55 0"/>
+      <feBlend in="SourceGraphic" mode="normal"/>
+    </filter>
+    <filter id="softGlow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="12" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <clipPath id="screenClip">
+      <rect x="344" y="228" width="336" height="568" rx="56"/>
+    </clipPath>
+  </defs>
+
+  <rect x="24" y="24" width="976" height="976" rx="228" fill="url(#background)"/>
+  <rect x="24" y="24" width="976" height="976" rx="228" fill="url(#backgroundSheen)"/>
+  <path d="M80 724C250 848 407 890 612 846C769 812 880 700 954 556"
+        fill="none" stroke="#56dfff" stroke-opacity="0.08" stroke-width="3"/>
+  <path d="M106 798C277 908 442 927 628 871C779 825 877 722 930 620"
+        fill="none" stroke="#8d8aff" stroke-opacity="0.08" stroke-width="2"/>
+  <rect x="25.5" y="25.5" width="973" height="973" rx="226.5"
+        fill="none" stroke="#85eaff" stroke-opacity="0.2" stroke-width="3"/>
+
+  <g fill="none" stroke-linecap="round">
+    <path d="M702 246C786 279 834 352 834 438" stroke="#5fe9ff" stroke-opacity="0.34" stroke-width="12"/>
+    <path d="M729 213C841 259 908 355 908 470" stroke="#6a9bff" stroke-opacity="0.22" stroke-width="9"/>
+    <path d="M757 182C894 233 962 355 962 492" stroke="#9f8cff" stroke-opacity="0.13" stroke-width="7"/>
+  </g>
+  <circle cx="846" cy="474" r="9" fill="#65efff" filter="url(#softGlow)"/>
+
+  <g filter="url(#shadow)">
+    <rect x="286" y="148" width="452" height="724" rx="104" fill="#06152c" fill-opacity="0.72"/>
+    <rect x="294" y="140" width="436" height="724" rx="96" fill="url(#deviceShell)"/>
+    <rect x="307" y="153" width="410" height="698" rx="84"
+          fill="none" stroke="url(#deviceEdge)" stroke-width="7"/>
+    <rect x="344" y="228" width="336" height="568" rx="56" fill="url(#screen)"/>
+    <rect x="344" y="228" width="336" height="568" rx="56"
+          fill="none" stroke="#9ceeff" stroke-opacity="0.45" stroke-width="4"/>
+  </g>
+
+  <g clip-path="url(#screenClip)">
+    <rect x="344" y="228" width="336" height="568" fill="url(#screenLight)"/>
+    <path d="M366 700C435 645 475 605 513 543C554 477 589 411 663 315"
+          fill="none" stroke="#34e4f5" stroke-opacity="0.12" stroke-width="46"/>
+    <path d="M383 710C446 655 486 606 524 545C563 482 594 420 654 337"
+          fill="none" stroke="url(#beam)" stroke-opacity="0.88" stroke-width="18"/>
+    <path d="M393 742C457 684 510 628 548 563C583 503 618 437 672 373"
+          fill="none" stroke="#b9f7ff" stroke-opacity="0.4" stroke-width="4"/>
+    <path d="M360 316H468" stroke="#63efff" stroke-opacity="0.28" stroke-width="4"/>
+    <path d="M360 342H430" stroke="#8caaff" stroke-opacity="0.22" stroke-width="3"/>
+    <path d="M360 714H450" stroke="#5eeeff" stroke-opacity="0.2" stroke-width="3"/>
+  </g>
+
+  <rect x="474" y="183" width="76" height="11" rx="5.5" fill="#06152b" fill-opacity="0.65"/>
+  <rect x="455" y="804" width="114" height="10" rx="5" fill="#d5fbff" fill-opacity="0.66"/>
+
+  <circle cx="736" cy="738" r="128" fill="url(#touchGlow)"/>
+  <circle cx="736" cy="738" r="47" fill="#06152b" fill-opacity="0.8"
+          stroke="#54eaff" stroke-opacity="0.56" stroke-width="5"/>
+  <circle cx="736" cy="738" r="20" fill="#65f3ff" filter="url(#softGlow)"/>
+  <circle cx="736" cy="738" r="8" fill="#effeff"/>
+
+  <path d="M706 626L738 774L770 741L817 786L839 764L792 719L838 705Z"
+        fill="#f4feff" stroke="#0c437d" stroke-width="9" stroke-linejoin="round"
+        filter="url(#shadow)"/>
+  <path d="M723 654L745 741L765 720L795 748"
+        fill="none" stroke="#49dff2" stroke-opacity="0.92" stroke-width="6"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

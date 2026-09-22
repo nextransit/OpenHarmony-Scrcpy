@@ -237,8 +237,24 @@ class Toolbar(tk.Frame):
             state["after_id"] = widget.after(600, show)
 
         def show():
-            x = widget.winfo_rootx() + widget.winfo_width() + 6
-            y = widget.winfo_rooty() + widget.winfo_height() // 2 - 12
+            tip.update_idletasks()
+            tip_w = tip.winfo_reqwidth()
+            tip_h = tip.winfo_reqheight()
+            screen_w = widget.winfo_screenwidth()
+            screen_h = widget.winfo_screenheight()
+            widget_rx = widget.winfo_rootx()
+            widget_rw = widget.winfo_rooty()
+            widget_rh = widget.winfo_height()
+            left_x = widget_rx - tip_w - 8
+            right_x = widget_rx + widget.winfo_width() + 8
+            if left_x >= 0:
+                x = left_x
+            elif right_x + tip_w <= screen_w:
+                x = right_x
+            else:
+                x = max(2, min(left_x, screen_w - tip_w - 2))
+            y = widget_rw + widget_rh // 2 - tip_h // 2
+            y = max(2, min(y, screen_h - tip_h - 2))
             tip.geometry(f"+{x}+{y}")
             tip.deiconify()
             state["shown"] = True

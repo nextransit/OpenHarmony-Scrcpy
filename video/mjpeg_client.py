@@ -81,6 +81,8 @@ class MjpegStreamClient:
         self._stop_event = threading.Event()
         self.poll_thread: Optional[threading.Thread] = None
         self.monitor_thread: Optional[threading.Thread] = None
+        self._lifecycle_lock = threading.Lock()
+        self._active_conn = None
         # 目标显示尺寸 (由 video_display 在 canvas resize 时设置)
         # poll 线程解码 JPEG 后立即 resize 到这个尺寸, 主线程 PhotoImage 开销降到 ~2ms.
         self._target_size: Tuple[int, int] = (0, 0)
@@ -107,6 +109,10 @@ class MjpegStreamClient:
     
     def _try_connect(self, host: str, port: int, timeout: float) -> bool:
         try:
+            with self._lifecycle_lock:
+                if self.is_connected or self.is_streaming:
+                    print_log(LogLevel.INFO, self.log_title, "视频流已连接, 忽略重复连接")
+                    return True
             if requests is None:
                 print_log(LogLevel.ERROR, self.log_title, "需要安装 requests: pip install requests")
                 return False
@@ -155,15 +161,15 @@ class MjpegStreamClient:
         print_log(LogLevel.INFO, self.log_title, "工作线程已启动")
     
     def _poll_thread_func(self) -> None:
-        """轮询拉取 JPEG 帧 (复用长连接 + 自适应间隔).
+        """轮询拉取 JPEG 帧 (短连接 + 自适应间隔).
 
         关键修复 (真设备 RK3568 + busybox httpd + hdc fport):
         - 单次完整 GET (1080p JPEG ≈ 130KB) 实际需要 80-150ms, 因为 hdc fport 中转
         - 之前用 `urllib.request.urlopen(self.url, timeout=10)` 每次新建连接,
           hdc 端口 8710 ←→ 设备 5555 的转发链路 rx_queue 堆积, client 端 socket.readinto
           永远阻塞, 导致 "闪一下就黑屏" (只有最初 3 帧能拉到)
-        - 修复: 手动维护一个 http.client.HTTPConnection 长连接, 每次循环复用同一 socket
-          (Connection: keep-alive), 让 hdc fport 的转发通道一直热, 减少延迟
+        - 目标设备 busybox httpd 对 keep-alive 支持不稳定, 每帧使用短连接,
+          避免复用半关闭 socket 导致 IncompleteRead/RemoteDisconnected.
         - 自适应间隔: 起步 200ms; 上次 request 耗时 < 80ms 就降一点 (最低 100ms);
                     上次 request 耗时 > 200ms 就升一点 (最高 1000ms).
                     卡死/超时则将间隔升到 MAX.
@@ -177,25 +183,21 @@ class MjpegStreamClient:
         http_host = u.hostname or "127.0.0.1"
         http_port = u.port or 80
         http_path = u.path or "/"
-        conn = None  # 复用的长连接
         try:
             while not self._stop_event.is_set() and self.is_connected:
                 t_start = time.time()
                 jpeg_bytes = None
+                conn = None
                 try:
-                    # 长连接复用: 第一次创建, 后续 putrequest 复用
-                    if conn is None or not self._is_conn_alive(conn):
-                        try:
-                            if conn is not None:
-                                conn.close()
-                        except Exception:
-                            pass
-                        conn = http.client.HTTPConnection(
-                            http_host, http_port, timeout=5)
-                    conn.connect()
+                    # busybox httpd 在目标设备上经常主动关闭 keep-alive.
+                    # 每帧使用一个短连接, 能避免复用半关闭 socket 导致
+                    # IncompleteRead/RemoteDisconnected 后长期黑屏.
+                    conn = http.client.HTTPConnection(http_host, http_port, timeout=5)
+                    with self._lifecycle_lock:
+                        self._active_conn = conn
                     conn.putrequest("GET", http_path, skip_host=False)
                     conn.putheader("Host", f"{http_host}:{http_port}")
-                    conn.putheader("Connection", "keep-alive")
+                    conn.putheader("Connection", "close")
                     conn.putheader("User-Agent", "ohscrcpy/1.0")
                     conn.endheaders()
                     resp = conn.getresponse()
@@ -231,12 +233,13 @@ class MjpegStreamClient:
                     last_err = None
                     try:
                         img = Image.open(io.BytesIO(jpeg_bytes))
-                        img.draft("RGB", (self.config.width // 2, self.config.height // 2))
-                        img = img.convert("RGB")  # 真正解码在此, truncated 在这抛
+                        # 优化: 跳过 draft (draft 只节省内存不省 CPU).
+                        # 直接 convert 解码 + resize 到目标尺寸, 实测 4ms/帧.
+                        img = img.convert("RGB")
                         with self._target_size_lock:
                             tw, th = self._target_size
                         if tw > 0 and th > 0 and img.size != (tw, th):
-                            img = img.resize((tw, th), Image.Resampling.BOX)
+                            img = img.resize((tw, th), Image.Resampling.BILINEAR)
                         arr = np.asarray(img)
                     except Exception as e:
                         last_err = e
@@ -297,18 +300,30 @@ class MjpegStreamClient:
                     # 拉取失败时也更新 last_data_time, 防止监控线程误判超时.
                     # 真正"心跳停止"的标志是 poll 线程退出, 不是 last_data_time.
                     self.last_data_time = time.time()
-                    # 拉取失败 -> 关闭连接让下次重建, 拉大间隔让设备喘息
+                    # 拉取失败 -> 关闭连接让下次重建, 短退避后立即重试.
+                    # 旧实现用 POLL_INTERVAL_MS_MAX (600ms) + sleep 0.5s, 慢,
+                    # 看起来像"连接成功 -> 立即黑屏". 设备端 atomic rename 是 ~150ms
+                    # 周期, 200ms 退避足以避开下一次 rename 竞争窗口.
                     try:
                         if conn is not None: conn.close()
                     except Exception: pass
-                    conn = None
-                    current_poll_ms = self.POLL_INTERVAL_MS_MAX
+                    current_poll_ms = min(self.POLL_INTERVAL_MS_MAX, 200)
+                    time.sleep(0.05)  # 极短退避, 立即重试
                     # 关键: 即使 debug=False 也打印前 5 次失败 + 之后每 30 次, 避免静默卡死
                     self._fail_count = getattr(self, "_fail_count", 0) + 1
                     if self._fail_count <= 5 or self._fail_count % 30 == 0:
                         print_log(LogLevel.WARN, self.log_title,
                             f"拉取失败 #{self._fail_count}: {type(e).__name__}: {e}")
-                    time.sleep(0.5)
+                    time.sleep(0.1)
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    with self._lifecycle_lock:
+                        if self._active_conn is conn:
+                            self._active_conn = None
                 
                 # 自适应间隔控制 (current_poll_ms 已根据上次耗时调整)
                 elapsed = time.time() - t_start
@@ -323,9 +338,6 @@ class MjpegStreamClient:
             tb_text = traceback.format_exc()
             print_log(LogLevel.ERROR, self.log_title,
                 f"poll 顶层异常: {type(e).__name__}: {e}  tb={tb_text}")
-            try:
-                if conn is not None: conn.close()
-            except Exception: pass
             self.is_connected = False
             raise
         finally:
@@ -410,23 +422,28 @@ class MjpegStreamClient:
             self._target_size = (int(width), int(height))
     
     def disconnect(self) -> None:
+        print_log(LogLevel.INFO, self.log_title, "开始断开视频流")
         self._stop_event.set()
         self.is_connected = False
         self.is_streaming = False
-        
-        def disconnect_async():
-            if self.poll_thread and self.poll_thread.is_alive():
-                self.poll_thread.join(timeout=1.0)
-            if self.monitor_thread and self.monitor_thread.is_alive():
-                self.monitor_thread.join(timeout=1.0)
-            while not self.frame_queue.empty():
-                try:
-                    self.frame_queue.get_nowait()
-                except queue.Empty:
-                    break
-            print_log(LogLevel.INFO, self.log_title, "断开连接已完成")
-        
-        threading.Thread(target=disconnect_async, daemon=True).start()
+        with self._lifecycle_lock:
+            active_conn = self._active_conn
+        if active_conn is not None:
+            try:
+                active_conn.close()
+            except Exception:
+                pass
+
+        current = threading.current_thread()
+        for worker in (self.poll_thread, self.monitor_thread):
+            if worker and worker.is_alive() and worker is not current:
+                worker.join(timeout=1.0)
+        while not self.frame_queue.empty():
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                break
+        print_log(LogLevel.INFO, self.log_title, "断开连接已完成")
 
 
 __all__ = ["MjpegStreamClient"]
