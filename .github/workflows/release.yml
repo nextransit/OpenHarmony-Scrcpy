@@ -29,7 +29,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyobjc-framework-Quartz; true
+
+      - name: Install macOS-only dependencies
+        if: runner.os == 'macOS'
+        run: pip install pyobjc-framework-Quartz
 
       - name: Syntax check (py_compile)
         run: python -m py_compile main.py ohscrcpy_client.py stream.py
