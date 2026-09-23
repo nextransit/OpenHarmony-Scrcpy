@@ -18,6 +18,7 @@
 """
 
 import os
+import sys
 import time
 import os
 import threading
@@ -102,6 +103,8 @@ class MainWindow:
         self.is_connected = False
         self.server_deploy_lock = threading.Lock()
         self.server_deploy_state = ServerDeployState.IDLE
+        # 无标题栏窗口拖拽状态
+        self._drag_press_xy: Optional[Tuple[int, int]] = None
         
         self.video_canvas = None
         self.status_text_id = None
@@ -226,22 +229,38 @@ class MainWindow:
         注意: 不要在这里调 state('zoomed') 或 root.deiconify/update_idletasks,
         会导致 root 提前 visible -> 用户看到一闪空白主窗口 (在 splash 后).
         _setup_ui 完成后, on_finish 会一次性 deiconify + lift.
+
+        无标题栏改动: 去掉了 WM_RESERVE_TOP/BOTTOM/DECORATION_H (无边框窗口不需要
+        给系统标题栏预留空间), 直接铺满可用屏幕区域 (macOS 上 -25 像素用于菜单栏避让)。
         """
         try:
             screen_w = self.root.winfo_screenwidth()
             screen_h = self.root.winfo_screenheight()
             cur_w = self.root.winfo_width()
             cur_h = self.root.winfo_height()
-            # WM 边框 + 标题栏 + 任务栏预留
-            WM_RESERVE_TOP = 30
-            WM_RESERVE_BOTTOM = 40
-            WM_DECORATION_H = 41
-            WM_DECORATION_W = 4
-            avail_h = screen_h - WM_RESERVE_TOP - WM_RESERVE_BOTTOM - WM_DECORATION_H
-            avail_w = screen_w - WM_DECORATION_W * 2
-            MIN_W, MIN_H = 1100, 800
-            win_w = max(MIN_W, int(avail_w * 0.95))
-            win_h = max(MIN_H, int(avail_h * 0.95))
+            # 无边框窗口: macOS 顶部菜单栏高度 (约 25px), Dock 高度 (约 70px)
+            # Windows 上任务栏通常约 40px; 这里用保守的固定预留
+            if sys.platform == "darwin":
+                MENU_BAR_H = 25
+                DOCK_H = 70
+            else:
+                MENU_BAR_H = 0
+                DOCK_H = 40
+            avail_h = screen_h - MENU_BAR_H - DOCK_H
+            avail_w = screen_w
+            # 默认窗口视频区尺寸: 452x803 (竖屏 9:16, 不含右侧工具栏).
+            # 真实窗口尺寸 = 视频区 + 右侧工具栏 + chrome (顶栏 28px)
+            # 视频连接后会通过 _adjust_window_to_video 再次调整.
+            VIDEO_W, VIDEO_H = 452, 803
+            RIGHT_PANEL_W = Theme.TOOLBAR_WIDTH + 16 + 12  # 68 + 16 + 12 = 96 (含 padx (4,8))
+            CHROME_H = 28  # 顶栏; main_frame/left_container 的 pady 已设 0
+            DEFAULT_W = VIDEO_W + RIGHT_PANEL_W
+            DEFAULT_H = VIDEO_H + CHROME_H
+            MIN_VIDEO_W, MIN_VIDEO_H = 452, 600
+            MIN_W = MIN_VIDEO_W + RIGHT_PANEL_W
+            MIN_H = MIN_VIDEO_H + CHROME_H
+            win_w = DEFAULT_W
+            win_h = DEFAULT_H
             win_w = min(win_w, avail_w)
             win_h = min(win_h, avail_h)
             if cur_w < win_w * 0.95 or cur_h < win_h * 0.95 or cur_w < MIN_W or cur_h < MIN_H:
@@ -252,13 +271,28 @@ class MainWindow:
                 print_log(LogLevel.INFO, "GUI",
                     f"窗口尺寸足够: {cur_w}x{cur_h} (屏幕 {screen_w}x{screen_h}, avail {avail_w}x{avail_h})")
         except Exception as e:
-            print_log(LogLevel.WARN, "GUI", f"窗口尺寸自适应失败: {e}, 用默认 1450x900")
-            self.root.geometry("1450x900")
+            print_log(LogLevel.WARN, "GUI", f"窗口尺寸自适应失败: {e}, 用默认 544x847")
+            self.root.geometry("544x831")
 
     def _setup_ui(self) -> None:
-        """设置UI (现代扁平化重构版)"""
+        """设置UI (无边框模式 + 极简顶栏).
+
+        无边框改动 (用户需求 #3):
+          - root.overrideredirect(True) 去掉系统标题栏
+          - 极简顶栏 28px: 左侧可拖拽区(OHScrcpy 文字 + 版本);右侧 — □ ✕ 三个圆形按钮
+          - 关闭/最小化 按钮调用 root.destroy / root.iconify (overrideredirect 后
+            不能再用系统按钮,需要自己实现)
+          - 完整 root.protocol(WM_DELETE_WINDOW, self._on_closing) 在 __init__ 中绑定,
+            关闭按钮直接调用 root.destroy 即可触发 _on_closing.
+        """
         # 根窗口背景
         self.root.configure(bg=Theme.BG_BASE)
+        # 关键: overrideredirect 去掉系统标题栏. 但 macOS 上需要先 deactivate focus
+        # 否则 NSWindow 创建后无法 style mask. Tk 在创建 root 时已经处理,这里只需 True.
+        try:
+            self.root.overrideredirect(True)
+        except Exception as e:
+            print_log(LogLevel.WARN, self.log_title, f"overrideredirect 失败 (回退有边框): {e!r}")
         self._create_title_bar()
         self._create_main_content()
         self._create_status_bar()
@@ -268,51 +302,209 @@ class MainWindow:
         self.root.update_idletasks()
 
     def _create_title_bar(self) -> None:
-        """现代扁平标题栏 (36px 高, 深色 Slate + 顶部光带)."""
+        """极简顶栏 (28px 高, 深色, scrcpy 风格).
+
+        布局:
+          [OHScrcpy • 版本号]  (左侧, 可拖拽区)
+                                          [• 设备状态] [?] [—] [□] [✕]
+        改动 (无边框模式):
+          * 顶栏 28px (旧 36px + 2px 光带 -> 简化),颜色 BG_PANEL
+          * — □ ✕ 三个按钮: 最小化 / 最大化(无边框窗口: toggle zoomed)
+                                / 关闭
+          * 整个左侧区域绑定 <Button-1>/<B1-Motion> 实现窗口拖拽
+          * 帮助按钮 (?) 保留
+        """
+        bar_h = 28
         title_frame = tk.Frame(
-            self.root, height=Theme.TITLE_BAR_HEIGHT, bg=Theme.BG_PANEL,
+            self.root, height=bar_h, bg=Theme.BG_PANEL,
         )
         title_frame.pack(fill=tk.X)
         title_frame.pack_propagate(False)
 
-        # 顶部 2px 青色光带 (品牌高光)
-        title_glow = tk.Frame(
-            title_frame, height=2, bg=BrandColor.PRIMARY_LIGHT,
-        )
-        title_glow.pack(side=tk.TOP, fill=tk.X)
-
-        # 左侧: 应用名
+        # 左侧: 应用名 (可拖拽区)
         left = tk.Frame(title_frame, bg=Theme.BG_PANEL)
-        left.pack(side=tk.LEFT, padx=12, pady=0)
+        left.pack(side=tk.LEFT, padx=10, pady=0)
 
-        tk.Label(
+        app_label = tk.Label(
             left, text="OHScrcpy",
-            font=Theme.FONT_TITLE, fg=Theme.ACCENT, bg=Theme.BG_PANEL,
-        ).pack(side=tk.LEFT, padx=(0, 6))
-        tk.Label(
-            left, text=f"OpenHarmony 投屏  •  {VERSION}",
-            font=Theme.FONT_SMALL, fg=Theme.TEXT_MUTED, bg=Theme.BG_PANEL,
-        ).pack(side=tk.LEFT)
-
-        # 右侧: 帮助图标 + 设备状态
-        right = tk.Frame(title_frame, bg=Theme.BG_PANEL)
-        right.pack(side=tk.RIGHT, padx=12, pady=0)
-
-        # 帮助按钮 (?)
-        help_btn = ModernButton(
-            right, icon="?", text="", command=self._show_help_dialog,
-            style="ghost", width=28, height=28, icon_only=True,
+            font=(Theme.FONT_FAMILY, 9, "bold") if hasattr(Theme, "FONT_FAMILY") else Theme.FONT_SMALL,
+            fg=Theme.ACCENT, bg=Theme.BG_PANEL,
         )
-        help_btn.pack(side=tk.RIGHT, padx=(4, 0))
-        help_btn._radius = 14   # 圆形
-        help_btn._draw()
+        app_label.pack(side=tk.LEFT, padx=(0, 4))
+        ver_label = tk.Label(
+            left, text=f"• {VERSION}",
+            font=Theme.FONT_SMALL, fg=Theme.TEXT_MUTED, bg=Theme.BG_PANEL,
+        )
+        ver_label.pack(side=tk.LEFT)
 
-        # 设备状态文字
+        # 右侧: 帮助 + 设备状态 + 最小化 / 最大化 / 关闭
+        right = tk.Frame(title_frame, bg=Theme.BG_PANEL)
+        right.pack(side=tk.RIGHT, padx=4, pady=0)
+
+        # ✕ 关闭 (红色)
+        close_btn = tk.Label(
+            right, text="✕", font=("Arial", 12),
+            fg=Theme.TEXT_MUTED, bg=Theme.BG_PANEL,
+            width=3, cursor="hand2",
+        )
+        close_btn.pack(side=tk.RIGHT, padx=2)
+        close_btn.bind("<Button-1>", lambda e: self.root.destroy())
+        close_btn.bind("<Enter>", lambda e: close_btn.config(fg="white", bg="#e74c3c"))
+        close_btn.bind("<Leave>", lambda e: close_btn.config(fg=Theme.TEXT_MUTED, bg=Theme.BG_PANEL))
+
+        # □ 最大化 (toggle zoomed)
+        max_btn = tk.Label(
+            right, text="□", font=("Arial", 11),
+            fg=Theme.TEXT_MUTED, bg=Theme.BG_PANEL,
+            width=3, cursor="hand2",
+        )
+        max_btn.pack(side=tk.RIGHT, padx=2)
+        max_btn.bind("<Button-1>", lambda e: self._toggle_maximize())
+        max_btn.bind("<Enter>", lambda e: max_btn.config(fg=Theme.TEXT_PRIMARY))
+        max_btn.bind("<Leave>", lambda e: max_btn.config(fg=Theme.TEXT_MUTED))
+
+        # — 最小化
+        min_btn = tk.Label(
+            right, text="—", font=("Arial", 12),
+            fg=Theme.TEXT_MUTED, bg=Theme.BG_PANEL,
+            width=3, cursor="hand2",
+        )
+        min_btn.pack(side=tk.RIGHT, padx=2)
+        min_btn.bind("<Button-1>", lambda e: self.root.iconify())
+        min_btn.bind("<Enter>", lambda e: min_btn.config(fg=Theme.TEXT_PRIMARY))
+        min_btn.bind("<Leave>", lambda e: min_btn.config(fg=Theme.TEXT_MUTED))
+
+        # ? 帮助按钮
+        help_btn = tk.Label(
+            right, text="?", font=("Arial", 11, "bold"),
+            fg=Theme.TEXT_MUTED, bg=Theme.BG_PANEL,
+            width=3, cursor="hand2",
+        )
+        help_btn.pack(side=tk.RIGHT, padx=2)
+        help_btn.bind("<Button-1>", lambda e: self._show_help_dialog())
+        help_btn.bind("<Enter>", lambda e: help_btn.config(fg=Theme.TEXT_PRIMARY))
+        help_btn.bind("<Leave>", lambda e: help_btn.config(fg=Theme.TEXT_MUTED))
+
+        # 设备状态 (右侧, 最小化按钮左边)
         self.device_status_label = tk.Label(
             right, text="● 未连接",
             font=Theme.FONT_SMALL, fg=Theme.TEXT_MUTED, bg=Theme.BG_PANEL,
         )
         self.device_status_label.pack(side=tk.RIGHT, padx=(0, 8))
+
+        # 拖拽逻辑: 整条顶栏 (除按钮外) <Button-1> 记录 root 坐标, <B1-Motion> 移动
+        for w in (title_frame, left, app_label, ver_label, self.device_status_label):
+            try:
+                w.bind("<Button-1>", self._on_titlebar_press, add="+")
+                w.bind("<B1-Motion>", self._on_titlebar_drag, add="+")
+                w.bind("<ButtonRelease-1>", self._on_titlebar_release, add="+")
+                # 鼠标指针改成手型 (提示可拖拽)
+                w.bind("<Enter>", lambda e, ww=w: ww.config(cursor="fleur"), add="+")
+                w.bind("<Leave>", lambda e, ww=w: ww.config(cursor=""), add="+")
+            except Exception:
+                pass
+
+    def _on_titlebar_press(self, event) -> None:
+        """无边框窗口拖拽: 记录鼠标按下时的 root 坐标 (屏幕坐标)."""
+        try:
+            self._drag_press_xy = (self.root.winfo_pointerx(), self.root.winfo_pointery())
+            self._drag_window_xy = (self.root.winfo_x(), self.root.winfo_y())
+        except Exception:
+            self._drag_press_xy = None
+            self._drag_window_xy = None
+
+    def _on_titlebar_drag(self, event) -> None:
+        """无边框窗口拖拽: 计算偏移并设置新 geometry."""
+        if not getattr(self, "_drag_press_xy", None):
+            return
+        if not getattr(self, "_drag_window_xy", None):
+            return
+        try:
+            dx = self.root.winfo_pointerx() - self._drag_press_xy[0]
+            dy = self.root.winfo_pointery() - self._drag_press_xy[1]
+            new_x = self._drag_window_xy[0] + dx
+            new_y = self._drag_window_xy[1] + dy
+            self.root.geometry(f"+{new_x}+{new_y}")
+        except Exception:
+            pass
+
+    def _on_titlebar_release(self, event) -> None:
+        """拖拽结束,清状态."""
+        self._drag_press_xy = None
+        self._drag_window_xy = None
+
+    def _toggle_maximize(self) -> None:
+        """无边框窗口的 toggle zoomed: 用 wm_state 跟踪当前状态."""
+        try:
+            cur = self.root.wm_state()
+        except Exception:
+            cur = "normal"
+        if cur == "zoomed":
+            self.root.wm_state("normal")
+        else:
+            # macOS 上 wm_state("zoomed") 会调用 NSWindow zoom, 但 overrideredirect 后
+            # 行为不一定生效; 兜底是设一个铺满屏幕的 geometry.
+            try:
+                self.root.wm_state("zoomed")
+            except Exception:
+                sw = self.root.winfo_screenwidth()
+                sh = self.root.winfo_screenheight()
+                self.root.geometry(f"{sw}x{sh}+0+0")
+
+    def _adjust_window_to_video(self, video_w: int, video_h: int) -> None:
+        """根据视频真实比例自适应窗口 — 用户需求 #2.
+
+        视频比例决定窗口比例:
+          竖屏 OHOS (e.g. 1080x2400, 9:20) -> 窗口高瘦
+          横屏 (e.g. 1920x1080, 16:9)      -> 窗口宽矮
+          任意比例都自适应.
+
+        只在第一次拿到视频帧 / 视频尺寸变化时调用一次. 用户手动调窗后不再跟随.
+        """
+        if not video_w or not video_h or video_w <= 0 or video_h <= 0:
+            return
+        if getattr(self, "_window_adjusted_for_video", None) == (video_w, video_h):
+            return
+        try:
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            if sys.platform == "darwin":
+                top_reserve, dock_reserve = 25, 70
+            else:
+                top_reserve, dock_reserve = 0, 40
+            avail_h = screen_h - top_reserve - dock_reserve
+            avail_w = screen_w
+
+            target_h = int(avail_h * 0.95)
+            target_h = max(600, min(target_h, avail_h))
+
+            # 右侧工具栏宽度 (与 _create_main_content 同步: Theme.TOOLBAR_WIDTH + 16 容器 + 8 pad)
+            right_w = Theme.TOOLBAR_WIDTH + 16 + 8
+            video_area_w = int(target_h * (video_w / video_h))
+            target_w = video_area_w + right_w
+            target_w = min(target_w, avail_w)
+            # 超过屏幕宽度时, 反过来按宽度算高度
+            if target_w >= avail_w * 0.98:
+                target_w = int(avail_w * 0.98)
+                video_area_w = max(400, target_w - right_w)
+                target_h = int(video_area_w * (video_h / video_w))
+                target_h = max(500, min(target_h, avail_h))
+
+            # 保持当前窗口左上角, 只改 size
+            try:
+                cur_x = self.root.winfo_x()
+                cur_y = self.root.winfo_y()
+            except Exception:
+                cur_x, cur_y = 0, 0
+            # 加 chrome: 只顶栏 28 (main_frame / left_container pady 已为 0)
+            target_h += 28
+
+            self.root.geometry(f"{target_w}x{target_h}+{cur_x}+{cur_y}")
+            self._window_adjusted_for_video = (video_w, video_h)
+            print_log(LogLevel.INFO, self.log_title,
+                f"窗口跟随视频比例: video={video_w}x{video_h} -> window={target_w}x{target_h}")
+        except Exception as e:
+            print_log(LogLevel.WARN, self.log_title, f"_adjust_window_to_video 失败: {e!r}")
 
     def _create_main_content(self) -> None:
         """主内容区: 投屏画布 + 紧凑工具条 (右侧 68px)."""
@@ -325,8 +517,10 @@ class MainWindow:
         right_container.pack_propagate(False)
 
         # ── 左侧 (后 pack, 占满剩余空间) ──
+        # 关键: 不留边距 (padx/pady=0), 让 video_canvas 实际尺寸精确等于
+        # _adjust_window_to_video 算出的视频区尺寸 (e.g. 452x803 竖屏默认)
         left_container = tk.Frame(main_frame, bg=Theme.BG_BASE)
-        left_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0), pady=8)
+        left_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=0, pady=0)
 
         # 视频显示容器
         video_container = tk.Frame(left_container, bg=Theme.BG_BASE)
@@ -423,6 +617,7 @@ class MainWindow:
             ("F11", "切换底部状态栏"),
             ("F12", "启用/禁用键盘映射"),
             ("",    ""),
+            ("右键", "OHOS 等同 Back (触控板双指点按 / USB 鼠标右键 / Ctrl+点)"),
             ("↑↓←→", "桌面焦点导航 (自动重复)"),
             ("Enter","激活当前焦点项"),
             ("Esc",  "返回"),
@@ -592,8 +787,10 @@ class MainWindow:
                     root=self.root,
                     canvas=self.video_canvas,
                     device_controller=self.device_controller,
-                    performance_label=self.performance_label
+                    performance_label=self.performance_label,
                 )
+                # 视频尺寸变化 -> 调窗口 (用户需求 #2)
+                self.video_display.on_video_size = self._adjust_window_to_video
                 # 启动主线程 poll 循环
                 self.video_display.start_main_poll()
         except Exception as e:

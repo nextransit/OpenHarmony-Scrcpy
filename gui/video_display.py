@@ -52,6 +52,8 @@ class VideoDisplay:
         self.device_controller = device_controller
         self.performance_label = performance_label
         self.connection_manager = connection_manager
+        # 视频尺寸首次确定 / 变化时回调 (主线程), 供 main_window 调窗
+        self.on_video_size = None
         # 新增:PillBadge (左上角半透明状态) + PhoneFrame (外壳)
         self.pill_badge = PillBadge(canvas)
         self.phone_frame = PhoneFrame(canvas)
@@ -356,6 +358,12 @@ class VideoDisplay:
                         vc.set_target_size(self.display_width, self.display_height)
                     except Exception:
                         pass
+                # 视频尺寸变化 -> 通知 main_window 调窗口 (用户需求 #2)
+                if self.on_video_size:
+                    try:
+                        self.on_video_size(target_vw, target_vh)
+                    except Exception as e:
+                        print_log(LogLevel.WARN, self.log_title, f"on_video_size callback 失败: {e!r}")
 
             # 3) canvas resize 触发重算 (避免 Configure 事件丢失)
             if (canvas_width, canvas_height) != getattr(self, "_last_canvas_size", (0, 0)):
