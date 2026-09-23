@@ -35,11 +35,14 @@ class VideoPanel:
         self._create_panel()
     
     def _create_panel(self) -> None:
-        frame = tk.LabelFrame(self.parent, text="视频显示", font=("Microsoft YaHei", 10))
-        frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        # 改动: 用普通 Frame 而不是 LabelFrame, 去掉 "视频显示" 标题栏 + 内部 padding
+        # (LabelFrame 自带 ~5px padding + border, 让 canvas 实际尺寸比父容器小 21x20).
+        # 同时 padx=0 让 canvas 实际尺寸 = 父容器尺寸 (e.g. 452x803).
+        frame = tk.Frame(self.parent, bg="#1a1a2e")
+        frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=0, pady=0)
         
-        self.canvas = tk.Canvas(frame, bg="#1a1a2e", highlightthickness=1)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(frame, bg="#1a1a2e", highlightthickness=0, borderwidth=0)
+        self.canvas.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
         
         self.frame = frame
     
