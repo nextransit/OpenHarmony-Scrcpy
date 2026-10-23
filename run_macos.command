@@ -75,6 +75,11 @@ if [ "${OHCRCPY_AUTO_PUSH:-1}" = "1" ]; then
         if [ "$PUSH_CODEC" != "jpeg" ]; then
             "$PY" "$DIR/scripts/auto_push_server.py" --codec jpeg || true
         fi
+        # 预推设备端常驻输入代理: 把点击延迟从 ~380ms 降到 ~71ms
+        # (代理不可用时 GUI 自动回退到 hdc shell uinput)
+        if [ "$PUSH_CODEC" != "input_agent" ]; then
+            "$PY" "$DIR/scripts/auto_push_server.py" --codec input_agent || true
+        fi
     fi
 fi
 

@@ -67,9 +67,18 @@ _JPEG_CANDIDATES = {
     "x86_64": ["jpeg_server"],
 }
 
+# 设备端常驻输入代理 (点击延迟 ~71ms, 旧路径 ~380ms)
+_INPUT_AGENT_CANDIDATES = {
+    "aarch64": ["input_agent"],
+    "arm": ["input_agent_arm"],
+    "loongarch64": ["input_agent_loongarch64"],
+    "x86_64": ["input_agent"],
+}
+
 _REMOTE_SERVER = "/system/bin/ohscrcpy_server"
 _REMOTE_H264 = "/system/bin/oh264_streamer"
 _REMOTE_JPEG = "/data/local/tmp/ohscrcpy_jpeg_server"
+_REMOTE_INPUT_AGENT = "/data/local/tmp/ohscrcpy_input_agent"
 
 
 def _root() -> str:
@@ -97,7 +106,8 @@ def _list_targets(hdc: HDCCommandExecutor):
 def _pick_binary(arch: str, codec: str):
     """按架构挑选本地二进制 (支持厂商专属目录)."""
     root = _root()
-    table = {"h264": _H264_CANDIDATES, "jpeg": _JPEG_CANDIDATES}.get(codec, _SERVER_CANDIDATES)
+    table = {"h264": _H264_CANDIDATES, "jpeg": _JPEG_CANDIDATES,
+             "input_agent": _INPUT_AGENT_CANDIDATES}.get(codec, _SERVER_CANDIDATES)
     candidates = table.get(arch, [])
     if not candidates:
         return None
@@ -127,6 +137,7 @@ _DEVICE_SEARCH_PATHS = {
     ],
     "h264": ["/system/bin/oh264_streamer", "/data/local/tmp/oh264_streamer"],
     "jpeg": ["/data/local/tmp/ohscrcpy_jpeg_server", "/system/bin/ohscrcpy_jpeg_server"],
+    "input_agent": ["/data/local/tmp/ohscrcpy_input_agent"],
 }
 
 
@@ -168,7 +179,8 @@ def push_to_device(hdc: HDCCommandExecutor, sn: str, codec: str = "server",
         print(f"[auto-push] {sn}: 二进制架构 [{actual}] != 设备 [{arch}], 跳过")
         return False
 
-    remote = {"h264": _REMOTE_H264, "jpeg": _REMOTE_JPEG}.get(codec, _REMOTE_SERVER)
+    remote = {"h264": _REMOTE_H264, "jpeg": _REMOTE_JPEG,
+              "input_agent": _REMOTE_INPUT_AGENT}.get(codec, _REMOTE_SERVER)
     print(f"[auto-push] {sn}: arch={arch} local={local} (elf={actual}) remote={remote}")
 
     if dry_run:
@@ -206,9 +218,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="自动推送服务端到 OHOS 设备")
     parser.add_argument("--device", default="", help="只处理指定设备 SN")
     parser.add_argument("--codec", default="server",
-                        choices=["server", "h264", "jpeg"],
+                        choices=["server", "h264", "jpeg", "input_agent"],
                         help="server=ohscrcpy_server, h264=oh264_streamer, "
-                             "jpeg=jpeg_server (无busybox 设备的 MJPEG 服务)")
+                             "jpeg=jpeg_server (无busybox 设备的 MJPEG 服务), "
+                             "input_agent=设备端常驻输入代理 (低延迟点击)")
     parser.add_argument("--dry-run", action="store_true", help="只探测选型, 不推送")
     args = parser.parse_args()
 

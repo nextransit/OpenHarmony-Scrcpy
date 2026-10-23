@@ -28,6 +28,7 @@ from typing import Tuple, Optional, Any
 from core.constants import LogLevel
 from core.logger import print_log
 from core.hdc_executor import HDCCommandExecutor
+from core.input_agent_manager import InputAgentManager
 
 _IS_MACOS = sys.platform == "darwin"
 if _IS_MACOS:
@@ -94,6 +95,9 @@ class DeviceController:
         # 防抖: 同一坐标 + 短间隔的 mouse_up 视为重复 (RDP 反复 press 时会触发)
         self._last_tap_time: float = 0.0
         self._last_tap_pos: Optional[Tuple[int, int]] = None
+        # 设备端常驻输入代理 (input_agent): 点击延迟 ~71ms, 旧路径 ~380ms 且抖动.
+        # 代理不可用时自动回退到 hdc shell uinput.
+        self.input_agent: Optional["InputAgentManager"] = None
         self.log_title: str = "设备控制器"
         self._scroll_monitor = None
         self._focus_keep_active: bool = False
@@ -942,6 +946,11 @@ class DeviceController:
             dev_x = max(0, min(self.device_video_width - 1, dev_x))
         if self.device_video_height > 0:
             dev_y = max(0, min(self.device_video_height - 1, dev_y))
+        # 优先走设备端常驻输入代理 (~71ms, 旧路径每次起一个 hdc 进程 ~380ms)
+        agent = getattr(self, "input_agent", None)
+        if agent is not None and agent.is_available():
+            if agent.mouse_move(dev_x, dev_y):
+                return
         self.hdc.execute_async(
             ["shell", "uinput", "-M", "-m", str(dev_x), str(dev_y)],
             timeout=3,
@@ -967,6 +976,11 @@ class DeviceController:
             dev_x = max(0, min(self.device_video_width - 1, dev_x))
         if self.device_video_height > 0:
             dev_y = max(0, min(self.device_video_height - 1, dev_y))
+        # 优先走设备端常驻输入代理 (~71ms, 旧路径每次起一个 hdc 进程 ~380ms)
+        agent = getattr(self, "input_agent", None)
+        if agent is not None and agent.is_available():
+            if agent.mouse_move(dev_x, dev_y):
+                return
         self.hdc.execute_async(
             ["shell", "uinput", "-M", "-m", str(dev_x), str(dev_y)],
             timeout=3,
@@ -1111,6 +1125,19 @@ class DeviceController:
 
         keycode = self.KEY_MAPPINGS[key_name]
 
+        # 优先走设备端常驻输入代理 (代理内部就是 uinput -K -d/-u, 但省掉每次
+        # 启动 hdc 进程的开销)
+        agent = getattr(self, "input_agent", None)
+        if agent is not None and agent.is_available():
+            def _agent_up_later():
+                time.sleep(0.03)  # 30ms 间隔, 让设备 input service 处理 down
+                agent.key_up(keycode)
+            if agent.key_down(keycode):
+                threading.Thread(target=_agent_up_later, daemon=True).start()
+                print_log(LogLevel.DEBUG, self.log_title,
+                    f"发送按键 (输入代理): {key_name} (keycode={keycode})")
+                return True
+
         def _send_up_later():
             time.sleep(0.03)  # 30ms 间隔, 让设备 input service 处理 down
             self.hdc.execute_async(["shell", "uinput", "-K", "-u", str(keycode)], timeout=3)
@@ -1131,8 +1158,18 @@ class DeviceController:
         修复: 之前同步执行时, mouse_up 阻塞主线程 30-100ms, 期间新的 mouse_down
         事件被 Tk 主循环排队, 用户感受是"点击无反应 / 滑动卡顿".
         """
+        # 主路径 0: 设备端常驻输入代理 (~71ms)
+        agent = getattr(self, "input_agent", None)
+        if agent is not None and agent.is_available():
+            if agent.swipe(x1, y1, x2, y2, duration_ms):
+                print_log(LogLevel.DEBUG, self.log_title,
+                    f"输入代理滑动: ({x1},{y1}) -> ({x2},{y2}), {duration_ms}ms")
+                return True
+            print_log(LogLevel.WARN, self.log_title,
+                "输入代理滑动失败, 回退 uinput")
+
         # 主路径: 异步, 主线程立即返回
-        args = ["shell", "uinput", "-T", "-m",
+        args = ["shell", "uinput", "-T", "-i", "1", "-m",
                 str(x1), str(y1), str(x2), str(y2), str(duration_ms)]
         launched = self.hdc.execute_async(args, timeout=3)
         if launched:
@@ -1219,6 +1256,16 @@ class DeviceController:
                 print_log(LogLevel.WARN, self.log_title,
                     f"uinput -K -d 2 -u 2 探测异常: {e!r}")
 
+        # 优先走设备端常驻输入代理 (代理内部: 触摸定位 + KEY_BACK, 与旧链式命令等价)
+        agent = getattr(self, "input_agent", None)
+        if agent is not None and agent.is_available():
+            if agent.right_click(x, y):
+                print_log(LogLevel.INFO, self.log_title,
+                    f"右键 [输入代理]: 触摸定位 + KEY_BACK ({x},{y})")
+                return True
+            print_log(LogLevel.WARN, self.log_title,
+                "输入代理右键失败, 回退 uinput 链式")
+
         if self._uinput_btn2_works:
             # 主路径: -T -d/u 触摸定位 + -K -d 2 -u 2 (KEY_BACK, OHOS 把右键等同为 Back)
             # 用一条 shell 命令链式执行, 减少 hdc 调用次数.
@@ -1279,9 +1326,21 @@ class DeviceController:
         期间 Tk 主循环无法处理 mouse_up / 后续事件, 这是用户感受的"无反应"
         的另一个根因. 全部走 execute_async 解决.
         """
+        # 主路径 0: 设备端常驻输入代理 (~71ms, 旧路径 ~380ms 且抖动到 3.4s)
+        agent = getattr(self, "input_agent", None)
+        if agent is not None and agent.is_available():
+            if agent.tap(x, y):
+                print_log(LogLevel.DEBUG, self.log_title,
+                          f"输入代理 tap: ({x},{y})")
+                return True
+            print_log(LogLevel.WARN, self.log_title,
+                      "输入代理发送失败, 回退 uinput")
+
         # 主路径 1: uinput -T (直接触摸事件注入, ~220ms)
         # 实测: uinput -T -d xy -u xy 在 RK3568 OH3.2 上稳定且快 (220ms vs uitest 540ms)
-        args = ["shell", "uinput", "-T", "-d", str(x), str(y), "-u", str(x), str(y)]
+        # 加 -i 1 压缩 uinput 内部默认间隔 (实测 380ms -> 208ms)
+        args = ["shell", "uinput", "-T", "-i", "1",
+                "-d", str(x), str(y), "-u", str(x), str(y)]
         if self.hdc.execute_async(args, timeout=3):
             print_log(LogLevel.DEBUG, self.log_title,
                       f"uinput -T tap (async): ({x},{y})")
