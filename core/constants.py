@@ -21,7 +21,7 @@ from enum import IntEnum, auto
 
 # ==================== 项目信息 ====================
 AUTHOR = "BenZhou"
-PROJECT_URL = "https://gitcode.com/BenZhou/OpenHarmony_Scrcpy"
+PROJECT_URL = "https://github.com/nextransit/OpenHarmony-Scrcpy"
 VERSION = "v2.3.1"
 
 # ==================== 网络配置 ====================

@@ -21,7 +21,7 @@ set -euo pipefail
 
 HOST="${1:-ben@192.168.26.106}"
 TARGET="${2:-loongarch64-linux-ohos}"
-SDK="/media/ben/work_2026/opt/ohos-sdk-5.1.0.53-loongarch"
+SDK="/media/ben/work_2026/opt/toolchains/ohos-sdk-5.1.0.53-loongarch"
 REMOTE_DIR="jpeg_build_${TARGET}"
 BIN="jpeg_server_${TARGET}"
 
@@ -37,11 +37,16 @@ ssh -o BatchMode=yes "${HOST}" "
   test -x /usr/lib/llvm-18/bin/ld.lld || { echo 'NEED lld-18 (apt install lld-18)'; exit 1; }
   mkdir -p ~/${REMOTE_DIR}
   cd ~/${REMOTE_DIR}
-  # clang 的 resource dir 需要 <target 三元组> 目录名, SDK 里是 -linux-ohos 简写
-  if [ ! -d rd ]; then
+  # clang 的 resource dir 需要 <target 三元组> 目录名 (loongarch64-unknown-linux-ohos),
+  # SDK 里只有 loongarch64-linux-ohos. 目录名必须写成字面量 —
+  # 用 ${TARGET} 拼接会得到 loongarch64-linux-ohos-unknown-linux-ohos, 名字不对.
+  # 同时要检查实体目录里真的有文件 (失败残留的空目录会让 lld 报
+  # "cannot open libclang_rt.builtins.a").
+  if [ ! -f rd/lib/${TARGET}/libclang_rt.builtins.a ]; then
+    rm -rf rd
     cp -r \$SDK/native/llvm/lib/clang/15.0.4 rd
-    cd rd/lib
-    ln -sfn ${TARGET} ${TARGET}-unknown-linux-ohos
+    cp -r rd/lib/${TARGET} rd/lib/loongarch64-unknown-linux-ohos
+    cp -r rd/lib/${TARGET} rd/lib/loongarch64-unknown-linux-gnu
   fi
   echo TOOLCHAIN_OK
 "
@@ -72,6 +77,6 @@ ssh -o BatchMode=yes "${HOST}" "
 "
 
 echo "== 取回产物 =="
-scp -o BatchMode=yes "${HOST}:~/${REMOTE_DIR}/${BIN}" ./device/jpeg_server_${TARGET%%-linux-ohos}
-file ./device/jpeg_server_${TARGET%%-linux-ohos}
-echo "== 完成: device/jpeg_server_${TARGET%%-linux-ohos} =="
+scp -o BatchMode=yes "${HOST}:~/${REMOTE_DIR}/${BIN}" ./device/jpeg_server_loongarch
+file ./device/jpeg_server_loongarch
+echo "== 完成: device/jpeg_server_loongarch =="

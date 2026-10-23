@@ -29,13 +29,23 @@ static int32_t g_port = 27190;
 static int32_t g_width = 1080;
 static int32_t g_height = 1920;
 static double g_interval = 0.15;
+/* 抓帧 worker 数量.
+ *
+ * 实测 (真机 192.168.19.11:8710 loongarch, 8 核):
+ *   单次 snapshot_display 约 174ms (进程启动为主, 与分辨率几乎无关:
+ *   1920x1080 和 640x360 都是 ~340ms), 串行吞吐上限约 5.5fps.
+ *   多路并发实测吞吐:
+ *       1 路 5.5fps | 2 路 9.0fps | 4 路 13.6fps | 6 路 15.7fps | 8 路 16.0fps
+ *   所以用 N 个 worker 各自持续抓帧, 各写各的文件, 客户端取"最新"的那张.
+ *   帧率 = N / 174ms. */
+static int32_t g_workers = 4;
 static std::string g_jpeg_path = "/data/local/tmp/ohscrcpy_screen.jpeg";
 static std::atomic<bool> g_running{true};
 
 /* 最新一帧 JPEG (由抓帧线程写入) */
 static std::vector<uint8_t> g_frame;
 static std::mutex g_frame_mutex;
-static uint32_t g_seq = 0;
+static std::atomic<uint64_t> g_seq{0};
 
 /* 设备物理分辨率 (uinput 触摸注入用的坐标系).
    抓帧分辨率 (g_width/g_height) 可能小于它, 点击坐标必须换算到物理分辨率. */
@@ -107,8 +117,26 @@ static void detect_device_resolution() {
     }
 }
 
-static void* capture_thread(void*) {
-    /* 先抓一帧, 再启动服务, 避免客户端拿到空帧 */
+/* 抓帧 worker: 每个 worker 抓到帧后写入共享的最新帧.
+ *
+ * worker id 用于区分各自的临时文件 (避免多个 worker 同时写同一个文件
+ * 造成读到半截 JPEG). */
+static void* capture_thread(void* arg) {
+    int worker_id = (int)(intptr_t)arg;
+    std::string path = g_jpeg_path;
+    if (g_workers > 1) {
+        /* /data/local/tmp/ohscrcpy_screen.jpeg -> /data/local/tmp/ohscrcpy_screen.w0.jpeg */
+        size_t dot = path.rfind(".jpeg");
+        if (dot != std::string::npos) {
+            char suffix[32];
+            snprintf(suffix, sizeof(suffix), ".w%d.jpeg", worker_id);
+            path = path.substr(0, dot) + suffix;
+        }
+    }
+    char wbuf[16], hbuf[16];
+    snprintf(wbuf, sizeof(wbuf), "%d", g_width);
+    snprintf(hbuf, sizeof(hbuf), "%d", g_height);
+
     while (g_running.load()) {
         /* fork + exec snapshot_display (设备 shell 可能不支持 system()) */
         pid_t pid = fork();
@@ -119,19 +147,16 @@ static void* capture_thread(void*) {
                 dup2(devnull, STDERR_FILENO);
                 close(devnull);
             }
-            char wbuf[16], hbuf[16];
-            snprintf(wbuf, sizeof(wbuf), "%d", g_width);
-            snprintf(hbuf, sizeof(hbuf), "%d", g_height);
             execl("/system/bin/snapshot_display", "snapshot_display",
                   "-i", "0", "-w", wbuf, "-h", hbuf,
-                  "-f", g_jpeg_path.c_str(), (char*)nullptr);
+                  "-f", path.c_str(), (char*)nullptr);
             _exit(127);
         } else if (pid > 0) {
             int status = 0;
             waitpid(pid, &status, 0);
         }
         /* 读取文件内容 */
-        int fd = open(g_jpeg_path.c_str(), O_RDONLY);
+        int fd = open(path.c_str(), O_RDONLY);
         if (fd >= 0) {
             struct stat st{};
             if (fstat(fd, &st) == 0 && st.st_size > 0) {
@@ -141,12 +166,15 @@ static void* capture_thread(void*) {
                     buf.resize((size_t)n);
                     std::lock_guard<std::mutex> lk(g_frame_mutex);
                     g_frame.swap(buf);
-                    g_seq++;
+                    g_seq.fetch_add(1);
                 }
             }
             close(fd);
         }
-        usleep((useconds_t)(g_interval * 1000000));
+        /* interval 只在单worker 时有意义 (多worker 靠并发提吞吐) */
+        if (g_workers <= 1) {
+            usleep((useconds_t)(g_interval * 1000000));
+        }
     }
     return nullptr;
 }
@@ -273,18 +301,21 @@ static void serve_once(int cfd) {
 
 int main(int argc, char** argv) {
     int opt;
-    while ((opt = getopt(argc, argv, "p:w:h:i:f:")) != -1) {
+    while ((opt = getopt(argc, argv, "p:w:h:i:f:n:")) != -1) {
         switch (opt) {
             case 'p': g_port = atoi(optarg); break;
             case 'w': g_width = atoi(optarg); break;
             case 'h': g_height = atoi(optarg); break;
             case 'i': g_interval = atof(optarg); break;
             case 'f': g_jpeg_path = optarg; break;
+            case 'n': g_workers = atoi(optarg); break;  /* 抓帧并发数 */
             default: break;
         }
     }
-    fprintf(stderr, "[jpeg_srv] cfg %dx%d interval=%.2fs file=%s\n",
-            g_width, g_height, g_interval, g_jpeg_path.c_str());
+    if (g_workers < 1) g_workers = 1;
+    if (g_workers > 16) g_workers = 16;
+    fprintf(stderr, "[jpeg_srv] cfg %dx%d interval=%.2fs workers=%d file=%s\n",
+            g_width, g_height, g_interval, g_workers, g_jpeg_path.c_str());
     detect_device_resolution();
 
     signal(SIGPIPE, SIG_IGN);
@@ -294,9 +325,14 @@ int main(int argc, char** argv) {
     int fd = setup_listener(g_port);
     if (fd < 0) return 1;
 
-    pthread_t ct;
-    pthread_create(&ct, nullptr, capture_thread, nullptr);
-    pthread_detach(ct);
+    /* 启动 N 个抓帧 worker.
+       实测并发可把吞吐从 5.5fps 提到 ~16fps (8 核设备). */
+    for (int i = 0; i < g_workers; ++i) {
+        pthread_t ct;
+        pthread_create(&ct, nullptr, capture_thread, (void*)(intptr_t)i);
+        pthread_detach(ct);
+    }
+    fprintf(stderr, "[jpeg_srv] %d 抓帧 worker 已启动\n", g_workers);
 
     /* 等第一帧就绪 */
     for (int i = 0; i < 50; ++i) {

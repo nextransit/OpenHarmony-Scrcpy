@@ -9,6 +9,7 @@ MJPEG 视频流客户端 — 替代 HEVC 解码路径。
 import time
 import threading
 import queue
+import os
 import struct
 from typing import Optional, Callable, Tuple
 
@@ -36,6 +37,11 @@ class MjpegStreamClient:
     
     DEFAULT_PORT = 27190
     DEFAULT_PATH = "/screen.jpeg"
+    # MJPEG multipart 流路径: 设备端保持一条连接持续推帧.
+    # 实测 (loongarch 设备, 6 个抓帧 worker):
+    #   单帧轮询 /screen.jpeg   -> ~3fps  (每次都要新建 HTTP 连接 + 等新帧)
+    #   multipart 流 /screen.mjpeg -> ~9.6fps (一次连接, 持续推)
+    STREAM_PATH = "/screen.mjpeg"
     # 轮询间隔 (ms) — 自适应范围 [MIN, MAX].
     # 真实设备 (RK3568 + busybox httpd + hdc fport): 单次完整 GET 实际需要 80-150ms,
     # 如果间隔太短 (< 100ms), busybox httpd 单线程会被多个并发请求堵死, hdc 转发端口
@@ -62,6 +68,10 @@ class MjpegStreamClient:
         self.debug = debug
         
         self.is_connected: bool = False
+        # 是否使用 MJPEG multipart 流模式 (一次连接持续推帧).
+        # 实测流模式 ~9.6fps vs 单帧轮询 ~3fps.
+        # OHCRCPY_MJPEG_STREAM=0 可禁用.
+        self.use_stream: bool = os.environ.get("OHCRCPY_MJPEG_STREAM", "1") != "0"
         # 断线回调 (设备重启/hdc 断开/心跳超时 时通知上层).
         # 不设则上层 (GUI) 无法感知断线 -> 画面卡死但状态仍显示"已连接".
         self.on_disconnected = None
@@ -184,6 +194,181 @@ class MjpegStreamClient:
         print_log(LogLevel.INFO, self.log_title, "工作线程已启动")
     
     def _poll_thread_func(self) -> None:
+        """拉取 JPEG 帧.
+
+        优先用 MJPEG multipart 流 (一次连接持续推帧, 帧率高);
+        不可用时回退到单帧轮询 (短连接 + 自适应间隔).
+        """
+        if self.use_stream:
+            if self._stream_loop():
+                return
+            print_log(LogLevel.WARN, self.log_title,
+                "MJPEG 流模式失败, 回退单帧轮询")
+        self._poll_loop()
+
+    def _stream_loop(self) -> bool:
+        """MJPEG multipart 流模式: 一次连接, 持续读帧.
+
+        设备端 jpeg_server 的 /screen.mjpeg 返回:
+            Content-Type: multipart/x-mixed-replace; boundary=OHScrcpyFrame
+            每帧: --OHScrcpyFrame\r\nContent-Length: N\r\n\r\n<JPEG bytes>\r\n
+
+        返回 True 表示流模式正常结束 (应退出), False 表示应回退到轮询.
+        """
+        from urllib.parse import urlparse
+        u = urlparse(self.url)
+        http_host = u.hostname or "127.0.0.1"
+        http_port = u.port or 80
+        boundary = b"--OHScrcpyFrame"
+
+        import http.client
+        try:
+            conn = http.client.HTTPConnection(http_host, http_port, timeout=10)
+            with self._lifecycle_lock:
+                self._active_conn = conn
+            conn.putrequest("GET", self.STREAM_PATH, skip_host=False)
+            conn.putheader("Host", f"{http_host}:{http_port}")
+            conn.putheader("Connection", "close")
+            conn.putheader("User-Agent", "ohscrcpy/1.0")
+            conn.endheaders()
+            resp = conn.getresponse()
+            if resp.status != 200:
+                print_log(LogLevel.WARN, self.log_title, f"流模式 HTTP {resp.status}")
+                try: conn.close()
+                except Exception: pass
+                return False
+
+            print_log(LogLevel.INFO, self.log_title,
+                "MJPEG 流模式已连接 (multipart, 持续推帧)")
+            buf = bytearray()
+            while not self._stop_event.is_set() and self.is_connected:
+                try:
+                    # 必须用 read1 而不是 read: read(n) 会阻塞直到读满 n 字节,
+                    # 对持续推送的流式响应会一直卡住 (实测 0 帧).
+                    # read1 最多读一次 socket 缓冲里已有的数据, 立即返回.
+                    if hasattr(resp, "read1"):
+                        chunk = resp.read1(65536)
+                    else:
+                        chunk = resp.read(65536)
+                except Exception as e:
+                    if self._stop_event.is_set() or not self.is_connected:
+                        break
+                    print_log(LogLevel.WARN, self.log_title, f"流读取失败: {type(e).__name__}: {e}")
+                    break
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                self.total_bytes += len(chunk)
+                self.last_data_time = time.time()
+                self._fail_count = 0
+
+                # 从缓冲区切出完整帧.
+                # 注意: 数据不足时必须"保留现场等下一批", 不能丢弃已解析的头部 —
+                # 否则后续再也拼不出完整帧 (实测 0 帧).
+                while True:
+                    pos = buf.find(boundary)
+                    if pos < 0:
+                        # 防止缓冲无限增长
+                        if len(buf) > 4 * 1024 * 1024:
+                            del buf[:-1024 * 1024]
+                        break
+                    # part 头部: boundary 之后到 \r\n\r\n
+                    head_start = pos + len(boundary)
+                    head_end = buf.find(b"\r\n\r\n", head_start)
+                    if head_end < 0:
+                        break  # 头部还没收全, 等下一批
+                    header = bytes(buf[head_start:head_end]).decode("latin-1", "ignore")
+                    length = 0
+                    for line in header.split("\r\n"):
+                        if line.lower().startswith("content-length:"):
+                            try: length = int(line.split(":", 1)[1].strip())
+                            except ValueError: length = 0
+                            break
+                    if length <= 0:
+                        # 没有 Content-Length: 丢弃这个 part, 继续找下一个 boundary
+                        del buf[:head_end + 4]
+                        continue
+                    body_start = head_end + 4
+                    if len(buf) < body_start + length:
+                        break  # 帧体还没收全, 等下一批 (头部保留在 buf 里)
+                    jpeg_bytes = bytes(buf[body_start:body_start + length])
+                    del buf[:body_start + length]
+                    # 吃掉帧尾的 CRLF
+                    if len(buf) >= 2 and buf[:2] == b"\r\n":
+                        del buf[:2]
+                    self._handle_jpeg(jpeg_bytes)
+            try: conn.close()
+            except Exception: pass
+            return True
+        except Exception as e:
+            print_log(LogLevel.WARN, self.log_title, f"流模式异常: {type(e).__name__}: {e}")
+            return False
+
+    def _handle_jpeg(self, jpeg_bytes: bytes) -> bool:
+        """解码一帧 JPEG 并交给上层 (轮询模式与流模式共用).
+
+        返回 True 表示这帧处理成功.
+        """
+        arr = None
+        try:
+            img = Image.open(io.BytesIO(jpeg_bytes))
+            # 优化: 跳过 draft (draft 只节省内存不省 CPU).
+            # 直接 convert 解码 + resize 到目标尺寸, 实测 4ms/帧.
+            img = img.convert("RGB")
+            with self._target_size_lock:
+                tw, th = self._target_size
+            if tw > 0 and th > 0 and img.size != (tw, th):
+                img = img.resize((tw, th), Image.Resampling.BILINEAR)
+            arr = np.asarray(img)
+        except Exception as e:
+            self.bad_packet_bytes += len(jpeg_bytes)
+            if self.bad_packet_bytes % 1000 < len(jpeg_bytes):
+                print_log(LogLevel.WARN, self.log_title,
+                    f"JPEG 解析失败, 跳过本帧: {e}")
+            return False
+
+        # 帧质量检测 (MJPEG 模式: 设备端直出 JPEG, 几乎不会有马赛克.
+        #   阈值已经放宽到 10.0, 仅拦截极端情况 (整帧垂直条纹).
+        #   真有异常也不 sleep (会拖慢整个 poll 轮次), 仅记录 ratio 给 GUI 参考.)
+        bad, ratio = self._assess_frame_quality(arr)
+        if bad:
+            self.bad_frame_count += 1
+            self.last_bad_frame_ratio = ratio
+            if self.bad_frame_count % 10 == 1:
+                print_log(LogLevel.WARN, self.log_title,
+                    f"帧质量异常: edge_y/edge_x={ratio:.2f} 累计={self.bad_frame_count}")
+            # 仍然把帧入队 (不 sleep, 不 continue), 让用户能看到画面.
+        else:
+            if self.bad_frame_count > 0:
+                print_log(LogLevel.INFO, self.log_title,
+                    f"帧恢复正常 (累计异常已清零)")
+                self.bad_frame_count = 0
+
+        self.frame_count += 1
+        self.last_frame_time = time.time()
+
+        # MJPEG 路径: 跳过 frame_queue (旧 HEVC 路径才用),
+        # 直接调 on_frame_decoded 回调. frame_queue 在 MJPEG 模式下没人消费,
+        # put_nowait 总会抛 queue.Full, 导致 on_frame_decoded 永远不被调用.
+        if self.on_frame_decoded:
+            try:
+                self.on_frame_decoded(arr)
+            except Exception as ex:
+                print_log(LogLevel.ERROR, self.log_title,
+                    f"on_frame_decoded 抛异常: {ex}")
+                import traceback
+                traceback.print_exc()
+        # 仍然 put_nowait 给 frame_queue (兼容 HEVC 模式), 但失败不致命
+        try:
+            self.frame_queue.put_nowait(arr)
+        except queue.Full:
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+        return True
+
+    def _poll_loop(self) -> None:
         """轮询拉取 JPEG 帧 (短连接 + 自适应间隔).
 
         关键修复 (真设备 RK3568 + busybox httpd + hdc fport):
@@ -253,68 +438,7 @@ class MjpegStreamClient:
                     # NameError 被吞掉, 导致该帧被丢弃、poll 间隔被拉大 (FPS 掉到 1-3).
                     # 截断是字节内容问题, 同 bytes 再解 3 次结果一样.
                     # 简化: 解一次, 失败就跳过本帧, 下一轮 poll 拉新帧 (设备端 ~150ms 覆写一次).
-                    arr = None
-                    last_err = None
-                    try:
-                        img = Image.open(io.BytesIO(jpeg_bytes))
-                        # 优化: 跳过 draft (draft 只节省内存不省 CPU).
-                        # 直接 convert 解码 + resize 到目标尺寸, 实测 4ms/帧.
-                        img = img.convert("RGB")
-                        with self._target_size_lock:
-                            tw, th = self._target_size
-                        if tw > 0 and th > 0 and img.size != (tw, th):
-                            img = img.resize((tw, th), Image.Resampling.BILINEAR)
-                        arr = np.asarray(img)
-                    except Exception as e:
-                        last_err = e
-                        self.bad_packet_bytes += len(jpeg_bytes)
-                        if self.bad_packet_bytes % 1000 < len(jpeg_bytes):
-                            print_log(LogLevel.WARN, self.log_title,
-                                f"JPEG 解析失败, 跳过本帧: {last_err}")
-                        # 跳过本帧, 直接下一轮 (下一轮 poll 会拿到新 bytes)
-                        continue
-                    
-                    # 帧质量检测 (MJPEG 模式: 设备端直出 JPEG, 几乎不会有马赛克.
-                    #   阈值已经放宽到 10.0, 仅拦截极端情况 (整帧垂直条纹).
-                    #   真有异常也不 sleep (会拖慢整个 poll 轮次), 仅记录 ratio 给 GUI 参考.)
-                    bad, ratio = self._assess_frame_quality(arr)
-                    if bad:
-                        self.bad_frame_count += 1
-                        self.last_bad_frame_ratio = ratio
-                        if self.bad_frame_count % 10 == 1:
-                            print_log(LogLevel.WARN, self.log_title,
-                                f"帧质量异常: edge_y/edge_x={ratio:.2f} 累计={self.bad_frame_count}")
-                        # 仍然把帧入队 (不 sleep, 不 continue), 让用户能看到画面.
-                        # HEVC 严重马赛克的真正检测在 decoder.py 里, mjpeg 模式不绕过.
-                    else:
-                        if self.bad_frame_count > 0:
-                            print_log(LogLevel.INFO, self.log_title,
-                                f"帧恢复正常 (累计异常已清零)")
-                            self.bad_frame_count = 0
-                    
-                    self.frame_count += 1
-                    self.last_frame_time = time.time()
-
-                    # MJPEG 路径: 跳过 frame_queue (旧 HEVC 路径才用),
-                    # 直接调 on_frame_decoded 回调. frame_queue 在 MJPEG 模式下没人消费,
-                    # put_nowait 总会抛 queue.Full, 导致 on_frame_decoded 永远不被调用.
-                    if self.on_frame_decoded:
-                        try:
-                            self.on_frame_decoded(arr)
-                        except Exception as ex:
-                            print_log(LogLevel.ERROR, self.log_title,
-                                f"on_frame_decoded 抛异常: {ex}")
-                            import traceback
-                            traceback.print_exc()
-                    # 仍然 put_nowait 给 frame_queue (兼容 HEVC 模式), 但失败不致命
-                    try:
-                        self.frame_queue.put_nowait(arr)
-                    except queue.Full:
-                        try:
-                            self.frame_queue.get_nowait()
-                            self.frame_queue.put_nowait(arr)
-                        except queue.Empty:
-                            pass
+                    self._handle_jpeg(jpeg_bytes)
                 except (requests.exceptions.RequestException,
                         urllib.error.URLError, ConnectionResetError,
                         TimeoutError, OSError,

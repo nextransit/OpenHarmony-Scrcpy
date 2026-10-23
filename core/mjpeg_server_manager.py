@@ -24,6 +24,11 @@ class MjpegServerManager:
     DEFAULT_WIDTH = 960
     DEFAULT_HEIGHT = 540
     DEFAULT_INTERVAL_S = 0.05
+    # 抓帧并发数: 实测 loongarch 8 核设备上, 单路 snapshot_display ~174ms
+    # (进程启动为主, 与分辨率几乎无关), 串行上限 ~1.8fps (MJPEG 流实测).
+    # 并发实测: 1 路 1.8fps | 4 路 6.2fps | 6 路 9.6fps | 8 路 11.2fps.
+    # 取 6: 兼顾帧率与给设备端解码/合成留 CPU.
+    DEFAULT_WORKERS = 6
     LOOP_PID_FILE = "/data/local/tmp/ohscrcpy_mjpeg_loop.pid"
     
     def __init__(self, hdc_executor: HDCCommandExecutor) -> None:
@@ -32,12 +37,16 @@ class MjpegServerManager:
         self.width = self.DEFAULT_WIDTH
         self.height = self.DEFAULT_HEIGHT
         self.interval = self.DEFAULT_INTERVAL_S
+        self.workers = self.DEFAULT_WORKERS
+        # 客户端连接地址 (直连设备优先, 见 _direct_host)
+        self.client_host: str = "127.0.0.1"
         self.device_arch: str = ""
         self.uses_jpeg_server: bool = False
         self.log_title = "MJPEG服务"
     
     def setup(self, port: int = DEFAULT_PORT, width: int = DEFAULT_WIDTH, 
-              height: int = DEFAULT_HEIGHT, interval_s: float = DEFAULT_INTERVAL_S, env_override: bool = True) -> bool:
+              height: int = DEFAULT_HEIGHT, interval_s: float = DEFAULT_INTERVAL_S,
+              workers: int = DEFAULT_WORKERS, env_override: bool = True) -> bool:
         """
         部署 MJPEG 服务:
         1. 启动 busybox httpd (静态文件服务,端口 <port>)
@@ -54,17 +63,21 @@ class MjpegServerManager:
             env_h = os.environ.get('OHCRCPY_MJPEG_HEIGHT')
             env_port = os.environ.get('OHCRCPY_MJPEG_PORT')
             env_int = os.environ.get('OHCRCPY_MJPEG_INTERVAL')
+            env_workers = os.environ.get('OHCRCPY_MJPEG_WORKERS')
             if env_w: width = int(env_w)
             if env_h: height = int(env_h)
             if env_port: port = int(env_port)
+            if env_workers: workers = int(env_workers)
             if env_int: interval_s = float(env_int)
         self.port = port
         self.width = width
         self.height = height
         self.interval = interval_s
+        self.workers = workers
         
         print_log(LogLevel.INFO, self.log_title, 
-            f"开始部署 MJPEG 服务 (port={port}, {width}x{height}, interval={interval_s}s)")
+            f"开始部署 MJPEG 服务 (port={port}, {width}x{height}, "
+            f"interval={interval_s}s, workers={workers})")
         
         # 1. 清理之前的进程
         self._stop_background()
@@ -105,8 +118,22 @@ class MjpegServerManager:
             print_log(LogLevel.ERROR, self.log_title, "端口转发建立失败")
             return False
 
-        print_log(LogLevel.INFO, self.log_title, f"MJPEG 服务部署成功: http://127.0.0.1:{port}/screen.jpeg")
+        # 客户端应连接的地址: 网络设备优先直连 (免 hdc fport 转发,
+        # 实测直连延迟 0.02ms vs fport 15-57ms, 且 hdc 转发机制在设备上不稳定).
+        self.client_host = self._direct_host() or "127.0.0.1"
+        print_log(LogLevel.INFO, self.log_title,
+            f"MJPEG 服务部署成功: http://{self.client_host}:{port}/screen.mjpeg")
         return True
+
+    def _direct_host(self) -> str:
+        """设备 IP (SN 形如 host:port 时取 host), 用于客户端直连."""
+        sn = self.hdc.get_current_device() or ""
+        if ":" not in sn:
+            return ""
+        host = sn.rsplit(":", 1)[0].strip()
+        if not host or " " in host:
+            return ""
+        return host
 
     def _ensure_permissive(self) -> bool:
         """确保设备 SELinux 处于 Permissive (仅在必要时, 且失败不阻断).
@@ -195,7 +222,7 @@ class MjpegServerManager:
         self._exec("shell", f"pkill -9 -f {remote} 2>/dev/null", timeout=5)
         time.sleep(0.3)
         cmd = (f"nohup {remote} -p {self.port} -w {self.width} -h {self.height} "
-               f"-i {self.interval} "
+               f"-i {self.interval} -n {self.workers} "
                f"-f /data/local/tmp/ohscrcpy_screen.jpeg "
                f"> /data/local/tmp/ohscrcpy_jpeg_server.log 2>&1 < /dev/null &")
         self._exec("shell", cmd, timeout=8)

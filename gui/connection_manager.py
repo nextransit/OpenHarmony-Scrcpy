@@ -61,6 +61,10 @@ class ConnectionManager:
         self._forwarded_port: int = -1
         
         self.log_title = "连接管理器"
+        # 视频流主机: 默认 127.0.0.1 (走 hdc fport 转发).
+        # 网络设备可设为设备 IP 直连, 免掉 fport 转发的 15-57ms 开销与不稳定性.
+        # 必须在 _init_video_client() 之前赋值 — 客户端构造时就绑定了 host.
+        self.stream_host: str = HOST
         
         self._init_video_client()
     
@@ -74,7 +78,10 @@ class ConnectionManager:
         sn = ""
         try:
             if self.device_manager is not None:
-                sn = self.device_manager.get_current_device() or ""
+                dev = self.device_manager.get_current_device()
+                # get_current_device() 返回 DeviceInfo 对象, 不是字符串 —
+                # 直接传给 resolve_codec 会抛 "not a container or iterable".
+                sn = getattr(dev, "sn", None) or (dev if isinstance(dev, str) else "") or ""
         except Exception:
             sn = ""
         try:
@@ -114,7 +121,7 @@ class ConnectionManager:
             from video.config import H264_STREAM_PORT
             print_log(LogLevel.INFO, self.log_title, "检测到 OHCRCPY_CODEC=h264, 使用 H.264 模式")
             self.video_client = H264StreamClient(
-                host='127.0.0.1',
+                host=self.stream_host,
                 port=int(os.environ.get('OHCRCPY_H264_PORT', str(H264_STREAM_PORT))),
                 on_frame_decoded=self.on_frame_decoded,
                 debug=self.debug,
@@ -122,7 +129,7 @@ class ConnectionManager:
         elif codec == 'mjpeg':
             print_log(LogLevel.INFO, self.log_title, "检测到 OHCRCPY_CODEC=mjpeg (默认), 使用 MJPEG 模式 (绕过 RK3568 HEVC bug)")
             self.video_client = MjpegStreamClient(
-                host='127.0.0.1',
+                host=self.stream_host,
                 port=int(os.environ.get('OHCRCPY_MJPEG_PORT', '27190')),
                 on_frame_decoded=self.on_frame_decoded,
                 debug=self.debug,
@@ -137,6 +144,24 @@ class ConnectionManager:
 
         self._attach_disconnect_callback()
     
+    def set_stream_host(self, host: str) -> None:
+        """切换视频流连接地址并重建视频客户端.
+
+        直连设备 IP 时使用: 免 hdc fport 转发的 15-57ms 开销,
+        且 hdc 端口转发在部分设备上不稳定 (频繁掉线).
+        """
+        if not host or host == self.stream_host:
+            return
+        print_log(LogLevel.INFO, self.log_title,
+            f"视频流地址切换: {self.stream_host} -> {host}")
+        self.stream_host = host
+        # 重建客户端 (host 在构造时绑定)
+        try:
+            self.video_client.disconnect()
+        except Exception:
+            pass
+        self._init_video_client()
+
     @property
     def state(self) -> str:
         with self._lock:
@@ -175,7 +200,7 @@ class ConnectionManager:
         
         try:
             print_log(LogLevel.DEBUG, self.log_title, f"连接视频流服务器...")
-            if self.video_client.connect(HOST, port):
+            if self.video_client.connect(self.stream_host, port):
                 self._forwarded_port = port
                 self._set_state(ConnectionState.CONNECTED)
                 print_log(LogLevel.INFO, self.log_title, f"连接成功")
