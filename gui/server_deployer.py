@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright (c) 2026 luodh0157.
+# Copyright (c) 2026 BenZhou.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -38,6 +38,7 @@ class ServerDeployer:
         self._state = ServerDeployState.IDLE
         self._lock = threading.Lock()
         self._server_manager = None
+        self.h264_server_manager = None
         
         self.log_title = "服务端部署器"
     
@@ -69,6 +70,21 @@ class ServerDeployer:
             daemon=True,
         ).start()
     
+    def _resolve_codec(self, sn: str = "") -> str:
+        """解析 codec — 环境变量优先, 否则按设备能力自动探测."""
+        from core.codec_detector import resolve_codec
+        try:
+            hdc = self.device_manager.hdc
+        except Exception:
+            hdc = None
+        if hdc is None:
+            return os.environ.get('OHCRCPY_CODEC', 'mjpeg').lower()
+        try:
+            return resolve_codec(hdc, sn)
+        except Exception as e:
+            print_log(LogLevel.WARN, self.log_title, f"codec 自动探测失败, 回退 mjpeg: {e!r}")
+            return os.environ.get('OHCRCPY_CODEC', 'mjpeg').lower()
+
     def _deploy_async(self, selected_device_name: str, devices: list, update_running_status: Callable, ui_callback: Callable) -> None:
         """异步部署流程"""
         import os
@@ -82,22 +98,27 @@ class ServerDeployer:
             ui_callback(lambda: self._report_finish(False, "设备选择失败"))
             return
         
+        # codec 选择: 环境变量优先, 否则按设备能力自动探测
+        codec = self._resolve_codec(target_device.sn)
+
         # H.264 模式: 部署 oh264_streamer (NDK 编译的二进制, 见 docs/H264_NDK_BUILD.md)
-        if os.environ.get('OHCRCPY_CODEC', 'mjpeg').lower() == 'h264':
+        if codec == 'h264':
             print_log(LogLevel.INFO, self.log_title, "[H264模式] 部署设备端 oh264_streamer")
             ui_callback(lambda: update_running_status("[H264模式] 部署设备端 oh264_streamer..."))
             from core.h264_server_manager import H264ServerManager
-            h264_mgr = H264ServerManager(self.hdc_executor)
+            h264_mgr = H264ServerManager(self.device_manager.hdc)
             if not h264_mgr.setup(env_override=True):
                 ui_callback(lambda: self._report_finish(False, "oh264_streamer 部署失败"))
                 return
+            self.h264_server_manager = h264_mgr
             self._server_manager = None
             ui_callback(lambda: self._report_finish(True, "H.264 模式,oh264_streamer 已就绪"))
             return
 
-        # 修复:RK3568 HEVC bug 绕过 — MJPEG 模式下跳过 ohscrcpy_server 部署
-        if os.environ.get('OHCRCPY_MJPEG_MODE', '') in ('1', 'true', 'yes'):
-            print_log(LogLevel.INFO, self.log_title, "[MJPEG模式] 跳过 ohscrcpy_server 部署,改用设备端 busybox httpd")
+        # MJPEG 模式: 跳过 ohscrcpy_server 部署 (由 MjpegServerManager 部署截图服务).
+        # 不再依赖 OHCRCPY_MJPEG_MODE 环境变量 — codec 已由设备能力探测决定.
+        if codec == 'mjpeg':
+            print_log(LogLevel.INFO, self.log_title, "[MJPEG模式] 跳过 ohscrcpy_server 部署,改用设备端截图服务")
             # 修复:从非主线程直接调 update_running_status 会触发 Tk 'main thread is not in main loop'
             ui_callback(lambda: update_running_status("[MJPEG模式] 跳过 ohscrcpy_server 部署"))
             ui_callback(lambda: self._report_finish(True, "MJPEG 模式,无需部署 ohscrcpy_server"))
@@ -152,6 +173,9 @@ class ServerDeployer:
         """停止服务端"""
         if self._server_manager:
             self._server_manager.stop_server()
+        if self.h264_server_manager:
+            self.h264_server_manager.stop()
+            self.h264_server_manager = None
 
 
 __all__ = ["ServerDeployer"]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright (c) 2026 luodh0157.
+# Copyright (c) 2026 BenZhou.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -57,6 +57,8 @@ from gui.server_deployer import ServerDeployer
 from gui.theme import Theme, ICONS
 from gui.widgets import ModernButton
 from core.mjpeg_server_manager import MjpegServerManager
+from video.config import H264_STREAM_PORT
+from gui.ttk_bootstrap import apply_theme, make_button as tb_button, make_label as tb_label, make_separator as tb_separator, has_ttkbootstrap
 
 
 class MainWindow:
@@ -66,6 +68,16 @@ class MainWindow:
         self.root = tk.Tk()
         self._app_icon_image = None
         self.root.title(f"OHScrcpy {VERSION}")
+        # 初始化 ttkbootstrap 主题 (必须在创建任何 widget 之前).
+        # 这样后续 ttk.Frame / ttk.Label 等会自动用 Bootstrap 样式.
+        # Canvas 区域 (视频显示 + 极简顶栏) 仍用 tk, 因为 ttk 不支持 Canvas.
+        try:
+            apply_theme(self.root)
+            if has_ttkbootstrap():
+                print(f"[GUI] ttkbootstrap 主题 'darkly' 已应用", flush=True)
+        except Exception as e:
+            # log_title 尚未初始化, 静默 fallback 到 print
+            print(f"[GUI] apply_theme 失败 (继续 tk): {e!r}", flush=True)
         # 关键: tk.Tk() 一旦创建 root, OS 会立刻渲染它 (空窗口, 默认 300x200).
         # 立刻 withdraw 让 OS 不渲染空主窗口.
         # 同时, 把所有 zoomed / geometry / 自适应窗口尺寸 计算 全部延后到
@@ -125,11 +137,15 @@ class MainWindow:
         self.video_display: Optional[VideoDisplay] = None
         self.server_deployer: Optional[ServerDeployer] = None
         self.mjpeg_server_manager: Optional[MjpegServerManager] = None
+        self.h264_server_manager = None
         
         self.device_status_label = None
         self.status_label = None
         self.connection_status_label = None
         self.performance_label = None
+        # 断线恢复:画面提示标记 + 自动恢复防抖
+        self._link_lost_overlay: bool = False
+        self._recover_scheduled: bool = False
         
         # 跨线程 GUI 更新队列 (必须在 _setup_ui 前初始化)
         import queue as _queue
@@ -507,22 +523,25 @@ class MainWindow:
             print_log(LogLevel.WARN, self.log_title, f"_adjust_window_to_video 失败: {e!r}")
 
     def _create_main_content(self) -> None:
-        """主内容区: 投屏画布 + 紧凑工具条 (右侧 68px)."""
-        main_frame = tk.Frame(self.root, bg=Theme.BG_BASE)
+        """主内容区: 投屏画布 + 紧凑工具条 (右侧 68px) — ttkbootstrap 容器."""
+        # ttkbootstrap Frame (背景自动跟 theme); video canvas 内部还是 tk.Canvas (PhotoImage)
+        from tkinter import ttk as tk_ttk
+        main_frame = tk_ttk.Frame(self.root, padding=0)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
 
         # ── 右侧 (先 pack, 固定宽度) ──
-        right_container = tk.Frame(main_frame, bg=Theme.BG_BASE, width=Theme.TOOLBAR_WIDTH + 16)
+        right_container = tk_ttk.Frame(main_frame, padding=4)
+        right_container.configure(width=Theme.TOOLBAR_WIDTH + 16)
         right_container.pack(side=tk.RIGHT, fill=tk.Y, padx=(4, 8), pady=8)
         right_container.pack_propagate(False)
 
         # ── 左侧 (后 pack, 占满剩余空间) ──
         # 关键: 不留边距 (padx/pady=0), 让 video_canvas 实际尺寸精确等于
         # _adjust_window_to_video 算出的视频区尺寸 (e.g. 452x803 竖屏默认)
-        left_container = tk.Frame(main_frame, bg=Theme.BG_BASE)
+        left_container = tk_ttk.Frame(main_frame, padding=0)
         left_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=0, pady=0)
 
-        # 视频显示容器
+        # 视频显示容器 (仍然 tk.Frame 以匹配 video_panel 的硬编码颜色)
         video_container = tk.Frame(left_container, bg=Theme.BG_BASE)
         video_container.pack(fill=tk.BOTH, expand=True)
 
@@ -553,8 +572,12 @@ class MainWindow:
         self.control_panel.set_buttons_enabled(False)
 
     def _create_status_bar(self) -> None:
-        """底部状态栏 (默认隐藏, F11 切换)."""
-        self.status_frame = tk.Frame(self.root, height=22, bg=Theme.BG_PANEL)
+        """底部状态栏 (默认隐藏, F11 切换) — ttkbootstrap 样式."""
+        self.status_frame = tb_label(self.root, text="", bootstyle="secondary")  # 占位 Frame
+        # ttkbootstrap 没有纯背景 Frame, 用 Label 当容器 (trick); 实际还是 Frame 行为
+        from tkinter import ttk as tk_ttk
+        self.status_frame = tk_ttk.Frame(self.root)
+        self.status_frame.configure(height=22)
         self._status_bar_packed = False
 
         self.status_label = tk.Label(
@@ -564,16 +587,18 @@ class MainWindow:
         )
         self.status_label.pack(side=tk.LEFT, padx=10)
 
-        self.connection_status_label = tk.Label(
+        # connection 状态 — 用 ttkbootstrap bootstyle 颜色 (success/danger/secondary)
+        self.connection_status_label = tb_label(
             self.status_frame, text="未连接",
-            font=Theme.FONT_SMALL, fg=Theme.ACCENT_HOT, bg=Theme.BG_PANEL,
+            font=Theme.FONT_SMALL, bootstyle="danger",
             anchor=tk.E,
         )
         self.connection_status_label.pack(side=tk.RIGHT, padx=10)
 
-        self.performance_label = tk.Label(
+        # FPS 性能 — 用 info 蓝色
+        self.performance_label = tb_label(
             self.status_frame, text="FPS: 0 | 帧数: 0",
-            font=Theme.FONT_SMALL, fg=Theme.ACCENT, bg=Theme.BG_PANEL,
+            font=Theme.FONT_SMALL, bootstyle="info",
         )
         self.performance_label.pack(side=tk.RIGHT, padx=20)
 
@@ -597,17 +622,23 @@ class MainWindow:
             self._update_device_status(f"OSD {state} (F8 切换)")
 
     def _show_help_dialog(self) -> None:
-        """点击 ? 弹出帮助/快捷键说明."""
-        win = tk.Toplevel(self.root)
+        """点击 ? 弹出帮助/快捷键说明 — ttkbootstrap 样式."""
+        # 如果有 ttkbootstrap, 用 ttkbootstrap.Window 否则降级 Toplevel
+        try:
+            import ttkbootstrap as ttk_b
+            win = ttk_b.Toplevel(self.root)
+        except ImportError:
+            win = tk.Toplevel(self.root)
         win.title("操作说明")
         win.geometry("460x520")
-        win.configure(bg=Theme.BG_BASE)
         win.attributes("-topmost", True)
 
-        tk.Label(
+        # 标题 (ttkbootstrap Label)
+        tb_label(
             win, text="OHScrcpy 快捷键",
-            font=Theme.FONT_TITLE, fg=Theme.TEXT_PRIMARY, bg=Theme.BG_BASE,
-        ).pack(pady=(16, 8), anchor="w", padx=20)
+            font=Theme.FONT_TITLE, bootstyle="inverse-info",
+            anchor="w",
+        ).pack(pady=(16, 8), anchor="w", padx=20, fill=tk.X)
 
         rows = [
             ("F5",  "刷新设备列表"),
@@ -627,26 +658,33 @@ class MainWindow:
             ("录屏", "工具条按钮 ●"),
             ("熄屏运行", "保持投屏但关闭设备屏幕, 省电"),
         ]
-        frame = tk.Frame(win, bg=Theme.BG_PANEL)
-        frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        # 滚动容器 + 表体 (ttkbootstrap Frame)
+        from tkinter import ttk as tk_ttk
+        scroll_frame = tk_ttk.Frame(win, padding=10)
+        scroll_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
 
         for i, (k, v) in enumerate(rows):
-            bg = Theme.BG_PANEL if i % 2 == 0 else Theme.BG_ELEVATED
-            row = tk.Frame(frame, bg=bg)
-            row.pack(fill=tk.X)
-            tk.Label(
+            if not k and not v:
+                # 分隔行
+                tb_separator(scroll_frame, bootstyle="secondary").pack(fill=tk.X, pady=4)
+                continue
+            row = tk_ttk.Frame(scroll_frame)
+            row.pack(fill=tk.X, pady=2)
+            tb_label(
                 row, text=k, font=("Consolas", 10, "bold"),
-                fg=Theme.ACCENT, bg=bg, width=14, anchor="w",
-            ).pack(side=tk.LEFT, padx=(12, 6), pady=4)
-            tk.Label(
+                bootstyle="info", width=14, anchor="w",
+            ).pack(side=tk.LEFT, padx=(12, 6))
+            tb_label(
                 row, text=v, font=Theme.FONT_SMALL,
-                fg=Theme.TEXT_PRIMARY, bg=bg, anchor="w",
-            ).pack(side=tk.LEFT, padx=6, pady=4)
+                bootstyle="", anchor="w",
+            ).pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
 
-        ModernButton(
+        # 关闭按钮 (ttkbootstrap, 居中)
+        tb_button(
             win, text="关闭", command=win.destroy,
-            style="secondary", width=100, height=32,
-        ).pack(pady=(4, 16))
+            bootstyle="secondary", width=12,
+        ).pack(pady=(8, 16))
 
     def _screenshot(self) -> None:
         """截屏: 把当前帧保存到 logs/."""
@@ -861,24 +899,146 @@ class MainWindow:
     
     def _on_connection_state_changed(self, state: str) -> None:
         """连接状态变化回调"""
+        was_connected = self.is_connected
         self.is_connected = (state == ConnectionState.CONNECTED)
-        self._defer_to_main(self._update_connection_ui)
-    
-    def _update_connection_ui(self) -> None:
-        """更新连接相关UI"""
+        self._defer_to_main(lambda: self._update_connection_ui(was_connected))
+
+    def _update_connection_ui(self, was_connected: bool = False) -> None:
+        """更新连接相关UI.
+
+        was_connected 用于区分"用户主动断开"与"设备异常掉线":
+        异常掉线时要在画面上给出明确提示, 否则用户只看到画面定格,
+        以为程序卡死.
+        """
         if self.is_connected:
             self.device_panel.set_connect_button_state("断开", "#e74c3c")
             if self.control_panel is not None:
                 self.control_panel.update_connect_button(True)
                 self.control_panel.set_buttons_enabled(True)
-            self.connection_status_label.config(text="已连接", fg="#2ecc71")
+            self.connection_status_label.config(text="已连接", bootstyle="success")
+            if was_connected is False and getattr(self, "_link_lost_overlay", None):
+                try:
+                    self.video_canvas.delete("link_lost")
+                except Exception:
+                    pass
+            return
+
+        # 未连接
+        self.device_panel.set_connect_button_state("连接", "#2ecc71")
+        if self.control_panel is not None:
+            self.control_panel.update_connect_button(False)
+            self.control_panel.set_buttons_enabled(False)
+        self.performance_label.config(text="FPS: 0 | 帧数: 0")
+
+        # 设备异常掉线 (之前是已连接状态) -> 明确提示 + 冻结画面标记
+        if was_connected:
+            self.connection_status_label.config(text="连接已断开", bootstyle="danger")
+            self._update_device_status("设备连接已断开")
+            self._show_link_lost_overlay()
+            # 自动恢复: 设备可能重启, hdc 需要重新 tconn
+            self._schedule_auto_recover()
         else:
-            self.device_panel.set_connect_button_state("连接", "#2ecc71")
-            if self.control_panel is not None:
-                self.control_panel.update_connect_button(False)
-                self.control_panel.set_buttons_enabled(False)
-            self.connection_status_label.config(text="未连接", fg="#e74c3c")
-            self.performance_label.config(text="FPS: 0 | 帧数: 0")
+            self.connection_status_label.config(text="未连接", bootstyle="danger")
+
+    def _show_link_lost_overlay(self) -> None:
+        """画面上叠加"连接已断开"提示 (避免用户以为画面卡死)."""
+        try:
+            if self.video_canvas is None:
+                return
+            w = self.video_canvas.winfo_width()
+            h = self.video_canvas.winfo_height()
+            if w <= 10 or h <= 10:
+                return
+            self.video_canvas.delete("link_lost")
+            self.video_canvas.create_text(
+                w // 2, h // 2,
+                text="设备连接已断开\n正在尝试自动恢复…",
+                fill="#e74c3c", font=("Helvetica", 16, "bold"),
+                tags="link_lost",
+            )
+            self._link_lost_overlay = True
+        except Exception as e:
+            print_log(LogLevel.WARN, self.log_title, f"显示断线提示失败: {e!r}")
+
+    def _schedule_auto_recover(self, delay_ms: int = 2000) -> None:
+        """安排自动恢复 (设备重启/hdc 断线后)."""
+        if getattr(self, "_recover_scheduled", False):
+            return
+        self._recover_scheduled = True
+
+        def _do_recover():
+            self._recover_scheduled = False
+            try:
+                self._recover_connection()
+            except Exception as e:
+                print_log(LogLevel.WARN, self.log_title, f"自动恢复失败: {e!r}")
+
+        try:
+            self.root.after(delay_ms, _do_recover)
+        except Exception:
+            pass
+
+    def _recover_connection(self) -> None:
+        """自动恢复连接: 重连 hdc -> 重新部署服务端 -> 重新连接视频流."""
+        if self.is_connected:
+            return
+        if self._get_server_deploy_state() != ServerDeployState.IDLE:
+            return
+        try:
+            dev = self.device_manager.get_current_device()
+            # get_current_device() 返回 DeviceInfo 对象, 需要取 .sn
+            sn = getattr(dev, "sn", None) or (dev if isinstance(dev, str) else None)
+        except Exception:
+            sn = None
+        if not sn:
+            print_log(LogLevel.INFO, self.log_title, "自动恢复: 无当前设备, 跳过")
+            return
+
+        print_log(LogLevel.INFO, self.log_title, f"自动恢复连接: {sn}")
+
+        # 1) hdc 重连 (设备重启后目标会消失, 需要重新 tconn)
+        try:
+            from core.arch_detector import ensure_connected
+            ensure_connected(self.hdc_executor, sn)
+        except Exception as e:
+            print_log(LogLevel.WARN, self.log_title, f"自动恢复: hdc 重连失败: {e!r}")
+
+        # 2) 刷新设备列表 (设备重启后 display_name/model 可能变化)
+        try:
+            self.device_manager.devices = self.device_manager.discover_devices()
+            print_log(LogLevel.INFO, self.log_title,
+                f"自动恢复: 刷新设备列表 -> {[d.sn for d in self.device_manager.devices]}")
+        except Exception as e:
+            print_log(LogLevel.DEBUG, self.log_title, f"刷新设备列表失败(忽略): {e!r}")
+
+        # 3) 若设备已不在列表, 用 SN 兜底恢复 (避免直接放弃)
+        devices = getattr(self.device_manager, "devices", []) or []
+        selected = self.device_panel.get_selected_device() if self.device_panel else ""
+        if not any(getattr(d, "sn", "") == sn for d in devices):
+            # 设备可能只是暂时掉线 (hdc 目标丢失), 列表刷新后仍找不到 -> 重新 tconn 再试一次
+            try:
+                from core.arch_detector import ensure_connected
+                ensure_connected(self.hdc_executor, sn)
+                self.device_manager.devices = self.device_manager.discover_devices()
+                devices = self.device_manager.devices or []
+            except Exception as e:
+                print_log(LogLevel.WARN, self.log_title, f"自动恢复: 重新 tconn 失败: {e!r}")
+        if not any(getattr(d, "sn", "") == sn for d in devices):
+            print_log(LogLevel.WARN, self.log_title,
+                f"自动恢复: 设备 {sn} 不在列表中, 保持断开状态等待用户重连")
+            self.connection_status_label.config(text="设备已离线", bootstyle="danger")
+            self._show_link_lost_overlay()
+            return
+
+        if not selected:
+            try:
+                selected = devices[0].display_name()
+                self.device_panel.set_selected_device(selected)
+            except Exception:
+                pass
+
+        # 4) 设备可能已重启, 服务端进程没了 -> 重新部署并连接
+        self._install_and_start_server_async()
     
     def _open_project_url(self, event: Optional[tk.Event] = None) -> None:
         """打开项目地址"""
@@ -1096,16 +1256,19 @@ class MainWindow:
         self._set_server_deploy_state(
             ServerDeployState.FINISHED if succ else ServerDeployState.IDLE
         )
-        self.connection_status_label.config(text="未连接", fg="#e74c3c")
+        self.connection_status_label.config(text="未连接", bootstyle="danger")
         if not succ:
             self.device_panel.set_connect_button_state("连接", "#2ecc71")
             if self.control_panel is not None:
                 self.control_panel.update_connect_button(False)
             messagebox.showerror("错误", f"{msg}")
             return
-        # 修复:RK3568 HEVC bug 绕过 — MJPEG 模式下部署完直接连接
-        if os.environ.get('OHCRCPY_MJPEG_MODE', '') in ('1', 'true', 'yes'):
-            print_log(LogLevel.INFO, self.log_title, "[MJPEG模式] server_deployer 完成,自动连接 MJPEG 服务")
+        # 部署完成后自动连接 (MJPEG / H.264 都一样).
+        # 之前只有 MJPEG 模式会自动连, H.264 部署完还得手动点连接 -> 用户看到"无图像".
+        codec = self._resolve_codec()
+        if codec in ('mjpeg', 'h264'):
+            print_log(LogLevel.INFO, self.log_title,
+                f"[{codec}模式] server_deployer 完成,自动连接")
             self._connect_device()
         else:
             self._set_server_deploy_state(ServerDeployState.IDLE)
@@ -1137,7 +1300,7 @@ class MainWindow:
         if self.control_panel is not None:
             self.control_panel.set_connect_button_connecting()
             self.control_panel.set_buttons_enabled(False)
-        self.connection_status_label.config(text="未连接", fg="#e74c3c")
+        self.connection_status_label.config(text="未连接", bootstyle="danger")
         self.performance_label.config(text="FPS: 0 | 帧数: 0")
         
         self.server_deployer.deploy(
@@ -1147,6 +1310,15 @@ class MainWindow:
             ui_callback=self._defer_to_main,
         )
     
+    def _resolve_codec(self, sn: str = "") -> str:
+        """解析 codec — 环境变量优先, 否则按设备能力自动探测."""
+        from core.codec_detector import resolve_codec
+        try:
+            return resolve_codec(self.hdc_executor, sn)
+        except Exception as e:
+            print_log(LogLevel.WARN, self.log_title, f"codec 自动探测失败, 回退 mjpeg: {e!r}")
+            return os.environ.get('OHCRCPY_CODEC', 'mjpeg').lower()
+
     def _connect_device(self) -> None:
         """连接设备"""
         state = self._get_server_deploy_state()
@@ -1179,6 +1351,13 @@ class MainWindow:
                 target_device = device
                 break
         
+        # 记住这个网络设备 (host:port), 下次启动/掉线后可自动 tconn 重连
+        if target_device:
+            try:
+                self.device_manager.remember_device(target_device.sn)
+            except Exception as e:
+                print_log(LogLevel.WARN, self.log_title, f"记住设备失败: {e!r}")
+
         if not target_device or not self.device_manager.select_device(target_device.sn):
             self._update_device_status("设备选择失败")
             self._set_server_deploy_state(ServerDeployState.IDLE)
@@ -1197,15 +1376,30 @@ class MainWindow:
                 self._defer_to_main(_restore_connect_button)
                 return
 
-            use_mjpeg = os.environ.get('OHCRCPY_MJPEG_MODE', '') in ('1', 'true', 'yes')
+            # codec 选择: 环境变量优先, 否则按设备能力自动探测.
+            # 精简版设备 (无 busybox) 必须走 H.264, 否则无图像.
+            codec = self._resolve_codec(target_device.sn)
+            use_mjpeg = codec == 'mjpeg'
+            print_log(LogLevel.INFO, self.log_title, f"使用 codec={codec}")
 
             if use_mjpeg:
                 mjpeg_port = int(os.environ.get('OHCRCPY_MJPEG_PORT', '27190'))
                 print_log(LogLevel.INFO, self.log_title, f"[MJPEG模式] 部署设备端 MJPEG 服务 (port={mjpeg_port})")
                 mjpeg_mgr = MjpegServerManager(self.hdc_executor)
                 self.mjpeg_server_manager = mjpeg_mgr
-                if not mjpeg_mgr.setup(port=mjpeg_port, env_override=True, interval_s=0.15):
+                # 不传 interval_s: 用 MjpegServerManager 的默认值 (0.05s),
+                # 硬编码 0.15 会把帧率压到 6fps 左右 (实测 960x540+0.05s 可达 16-20fps)
+                if not mjpeg_mgr.setup(port=mjpeg_port, env_override=True):
                     print_log(LogLevel.ERROR, self.log_title, "MJPEG 服务部署失败")
+                    self._defer_to_main(_restore_connect_button)
+                    return
+            elif codec == 'h264':
+                # H.264 模式: streamer 已在 server_deployer 部署并启动, 这里只做端口转发+连接
+                h264_port = int(os.environ.get('OHCRCPY_H264_PORT', str(H264_STREAM_PORT)))
+                print_log(LogLevel.INFO, self.log_title, f"[H264模式] 使用已部署的 H.264 streamer (port={h264_port})")
+                port = h264_port
+                if not self.device_manager.setup_port_forwarding(port, port):
+                    print_log(LogLevel.ERROR, self.log_title, f"H.264 端口转发失败，请尝试重新连接...")
                     self._defer_to_main(_restore_connect_button)
                     return
             else:
@@ -1230,6 +1424,22 @@ class MainWindow:
                 if self.connection_manager.connect(connect_port):
                     config = self.connection_manager.get_video_client().config
 
+                    # 把设备物理分辨率告诉 device_controller (点击坐标换算用).
+                    # 抓帧分辨率可能小于设备物理分辨率 (如抓 720p / 设备 1080p),
+                    # 不换算会导致点击位置偏移.
+                    if self.device_controller is not None:
+                        try:
+                            dw = int(getattr(config, "device_width", 0) or 0)
+                            dh = int(getattr(config, "device_height", 0) or 0)
+                            if dw > 0 and dh > 0:
+                                self.device_controller.set_device_resolution(dw, dh)
+                            else:
+                                print_log(LogLevel.WARN, self.log_title,
+                                    "设备未提供物理分辨率, 点击坐标按抓帧分辨率换算")
+                        except Exception as e:
+                            print_log(LogLevel.WARN, self.log_title,
+                                f"设置设备分辨率失败: {e!r}")
+
                     def _on_connect_success():
                         self.is_connected = True
                         self._set_server_deploy_state(ServerDeployState.IDLE)
@@ -1237,7 +1447,7 @@ class MainWindow:
                         if self.control_panel is not None:
                             self.control_panel.update_connect_button(True)
                             self.control_panel.set_buttons_enabled(True)
-                        self.connection_status_label.config(text="已连接", fg="#2ecc71")
+                        self.connection_status_label.config(text="已连接", bootstyle="success")
                         self.device_status_label.config(text=f"设备: {device.sn}")
 
                         self.video_display.displayed_frames = 0
@@ -1328,7 +1538,7 @@ class MainWindow:
         if self.control_panel is not None:
             self.control_panel.update_connect_button(False)
             self.control_panel.set_buttons_enabled(False)
-        self.connection_status_label.config(text="未连接", fg="#e74c3c")
+        self.connection_status_label.config(text="未连接", bootstyle="danger")
         self.device_status_label.config(text="设备: 未连接")
         self.performance_label.config(text="FPS: 0 | 帧数: 0")
         self._set_server_deploy_state(ServerDeployState.IDLE)

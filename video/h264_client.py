@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright (c) 2026 luodh.
+# Copyright (c) 2026 BenZhou.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -105,7 +105,7 @@ class H264StreamClient:
         with self._target_size_lock:
             self._target_size = (int(width), int(height))
 
-    def connect(self, host: str, port: int, timeout: float = 5.0,
+    def connect(self, host: str, port: int, timeout: float = 15.0,
                 max_retries: int = 3, retry_interval: float = 1.0) -> bool:
         for retry in range(max_retries):
             if retry > 0:
@@ -127,7 +127,13 @@ class H264StreamClient:
                 print_log(LogLevel.WARN, self.log_title, f"HTTP {resp.status}")
                 conn.close()
                 return False
-            probe = resp.read(65536)
+            # 只探测一小段: 设备端 (Surface 模式) 首个 GOP 可能很大,
+            # read(65536) 会一直等凑满 -> 超时. 用 read1 拿够起始码即可.
+            probe = b""
+            try:
+                probe = resp.read1(4096) or resp.read(4096)
+            except Exception:
+                probe = b""
             conn.close()
             if not probe or len(probe) < 8:
                 print_log(LogLevel.WARN, self.log_title, "服务端响应为空或过短")
@@ -259,69 +265,84 @@ class H264StreamClient:
             self.is_streaming = False
             print_log(LogLevel.INFO, self.log_title, "轮询线程结束")
 
+    def _emit_frame(self, arr) -> None:
+        """resize 到目标尺寸并回调 (从解码结果到 GUI 的统一出口)."""
+        try:
+            from PIL import Image
+            import numpy as np
+            pil = Image.fromarray(arr)
+            with self._target_size_lock:
+                tw, th = self._target_size
+            if tw > 0 and th > 0 and pil.size != (tw, th):
+                pil = pil.resize((tw, th), Image.Resampling.BOX)
+            arr2 = np.asarray(pil)
+        except Exception:
+            arr2 = arr
+        self.last_frame_time = time.time()
+        if self.on_frame_decoded:
+            try:
+                self.on_frame_decoded(arr2)
+            except Exception as ex:
+                print_log(LogLevel.WARN, self.log_title, f"on_frame_decoded 抛异常: {ex}")
+
+    def _has_idr(self, data: bytes) -> bool:
+        """数据里是否含 IDR 起始码 (用于判断可以提前解码)."""
+        return (b'\x00\x00\x00\x01\x65' in data or
+                b'\x00\x00\x01\x65' in data)
+
     def _fetch_and_decode_once(self) -> bool:
         """一次拉取 + 解码循环. 返回 True 表示至少 1 帧解码成功."""
         try:
-            conn = http.client.HTTPConnection(self.host, self.port, timeout=3)
+            # timeout 要够大: 设备端 GOP 可达数 MB, 3s 内读不完会误判为断流.
+            # socket 超时只在"两个连续包之间无数据"时才触发, 持续有码流时不会超时.
+            conn = http.client.HTTPConnection(self.host, self.port, timeout=15)
             conn.request("GET", self.path, headers={"Connection": "close"})
             resp = conn.getresponse()
             if resp.status not in (200, 206):
                 conn.close()
                 return False
+            # 边读边解码: 设备端是持续 HTTP bytestream (H.264 模式下一个 GOP 可达数 MB),
+            # 若等读满 256KB 再解码会先触发 3s 超时 -> 有码流但一帧都出不来.
             data = b""
+            any_decoded = False
+            decoded_bytes = 0
             try:
-                while len(data) < 256 * 1024:
-                    chunk = resp.read(8192)
+                while True:
+                    chunk = resp.read(16384)
                     if not chunk:
                         break
                     data += chunk
+                    decoded_bytes += len(chunk)
+                    self.total_bytes += len(chunk)
+                    # 攒够一个 IDR 或 256KB 就先解一帧, 保证低延迟
+                    if self._has_idr(data) or len(data) >= 256 * 1024:
+                        self._feed_parameter_sets(data)
+                        frames = self.decoder.decode_block(data)
+                        for arr in frames:
+                            if arr is None:
+                                continue
+                            self.frame_count += 1
+                            self._emit_frame(arr)
+                            any_decoded = True
+                        data = b""
             except Exception:
+                # 超时/断开: 已解出的帧仍然有效
                 pass
-            conn.close()
+            finally:
+                conn.close()
+
+            # 收尾: 处理残留数据
+            if data:
+                self._feed_parameter_sets(data)
+                for arr in self.decoder.decode_block(data):
+                    if arr is None:
+                        continue
+                    self.frame_count += 1
+                    self._emit_frame(arr)
+                    any_decoded = True
+            return any_decoded
         except Exception:
             return False
-
-        if not data:
-            return False
-        self.total_bytes += len(data)
-
-        # 累计 SPS/PPS 到解码器 extradata (不重建 codec, 首次若无参数集由 decode_block 处理)
-        self._feed_parameter_sets(data)
-        # 整块含 start code 的 GOP 交给 PyAV 自解析
-        frames = self.decoder.decode_block(data)
-        any_decoded = False
-        for arr in frames:
-            if arr is None:
-                continue
-            self.frame_count += 1
-            # resize 到目标尺寸
-            try:
-                from PIL import Image
-                import numpy as np
-                pil = Image.fromarray(arr)
-                with self._target_size_lock:
-                    tw, th = self._target_size
-                if tw > 0 and th > 0 and pil.size != (tw, th):
-                    pil = pil.resize((tw, th), Image.Resampling.BOX)
-                arr2 = np.asarray(pil)
-            except Exception:
-                arr2 = arr
-            self.last_frame_time = time.time()
-            if self.on_frame_decoded:
-                try:
-                    self.on_frame_decoded(arr2)
-                except Exception as ex:
-                    print_log(LogLevel.WARN, self.log_title, f"on_frame_decoded 抛异常: {ex}")
-            try:
-                self.frame_queue.put_nowait(arr2)
-            except queue.Full:
-                try:
-                    self.frame_queue.get_nowait()
-                    self.frame_queue.put_nowait(arr2)
-                except queue.Empty:
-                    pass
-            any_decoded = True
-        return any_decoded
 
     def _monitor_thread_func(self) -> None:
         from core.constants import HEARTBEAT_TIMEOUT

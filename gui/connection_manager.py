@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright (c) 2026 luodh0157.
+# Copyright (c) 2026 BenZhou.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -64,6 +64,42 @@ class ConnectionManager:
         
         self._init_video_client()
     
+    def _resolve_codec(self) -> str:
+        """解析 codec — 环境变量优先, 否则按设备能力自动探测.
+
+        设备精简版 (如 loongarch / KaihongOS) 没有 busybox, MJPEG 不可用,
+        必须自动切到 H.264, 否则表现为"无图像".
+        """
+        from core.codec_detector import resolve_codec
+        sn = ""
+        try:
+            if self.device_manager is not None:
+                sn = self.device_manager.get_current_device() or ""
+        except Exception:
+            sn = ""
+        try:
+            return resolve_codec(self.hdc_executor, sn)
+        except Exception as e:
+            print_log(LogLevel.WARN, self.log_title, f"codec 自动探测失败, 回退 mjpeg: {e!r}")
+            return os.environ.get('OHCRCPY_CODEC', 'mjpeg').lower()
+
+    def _attach_disconnect_callback(self) -> None:
+        """给 video_client 挂断线回调 — 设备重启/hdc 断开时通知上层.
+
+        没有这个回调时, video_client 断了但 connection_manager.state 仍是
+        CONNECTED, GUI 画面卡死且状态栏仍显示"已连接".
+        """
+        vc = self.video_client
+        if vc is None or not hasattr(vc, "on_disconnected"):
+            return
+        vc.on_disconnected = self._on_video_disconnected
+
+    def _on_video_disconnected(self, reason: str = "") -> None:
+        """视频流断开 (设备掉线/重启/心跳超时)."""
+        print_log(LogLevel.WARN, self.log_title, f"视频流断开: {reason}")
+        # 状态切到 DISCONNECTED, 触发 on_state_changed -> GUI 更新 UI
+        self._set_state(ConnectionState.DISCONNECTED)
+
     def _init_video_client(self) -> None:
         """初始化视频流客户端.
 
@@ -73,7 +109,7 @@ class ConnectionManager:
           - h265:  HEVC 模式 (走原 VideoStreamClient, RK3568 上有马赛克 bug)
         OHCRCPY_CODEC 未设时, 默认 mjpeg (向后兼容).
         """
-        codec = os.environ.get('OHCRCPY_CODEC', 'mjpeg').lower()
+        codec = self._resolve_codec()
         if codec == 'h264':
             from video.config import H264_STREAM_PORT
             print_log(LogLevel.INFO, self.log_title, "检测到 OHCRCPY_CODEC=h264, 使用 H.264 模式")
@@ -98,6 +134,8 @@ class ConnectionManager:
                 on_frame_decoded=self.on_frame_decoded,
                 debug=self.debug,
             )
+
+        self._attach_disconnect_callback()
     
     @property
     def state(self) -> str:

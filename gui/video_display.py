@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright (c) 2026 luodh0157.
+# Copyright (c) 2026 BenZhou.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -287,12 +287,20 @@ class VideoDisplay:
             return
 
         # 心跳超时保护
+        # 注意: mjpeg_client 在连续拉取失败达阈值时会把 last_data_time 置 0,
+        # 表示"链路已确认断开". 此时不能拿 current_time - 0 当超时秒数
+        # (会显示成 17 亿秒这种无意义的值), 要单独处理.
         try:
             video_client = self.connection_manager.get_video_client()
             if video_client and hasattr(video_client, "last_data_time"):
-                if current_time - video_client.last_data_time > HEARTBEAT_TIMEOUT:
+                last = video_client.last_data_time
+                if last == 0.0:
                     print_log(LogLevel.WARN, self.log_title,
-                              f"检测到心跳超时 ({current_time - video_client.last_data_time:.1f}秒),断开连接")
+                              "检测到视频流连续拉取失败,停止渲染")
+                    return
+                if current_time - last > HEARTBEAT_TIMEOUT:
+                    print_log(LogLevel.WARN, self.log_title,
+                              f"检测到心跳超时 ({current_time - last:.1f}秒),断开连接")
                     return
         except Exception:
             video_client = None

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright (c) 2026 luodh0157.
+# Copyright (c) 2026 BenZhou.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -73,6 +73,9 @@ class DeviceController:
         self.display_width: int = 0
         self.display_height: int = 0
         self.display_ratio: float = 0.0
+        # 设备物理分辨率 / 抓帧分辨率 (点击坐标换算). 默认 1.0 (相同).
+        self.input_scale_x: float = 1.0
+        self.input_scale_y: float = 1.0
         self.left: int = 0
         self.right: int = 0
         self.top: int = 0
@@ -123,6 +126,30 @@ class DeviceController:
         self._uinput_btn2_probed: bool = False
         self._uinput_btn2_works: bool = False
     
+    def set_device_resolution(self, device_width: int, device_height: int) -> None:
+        """设置设备物理分辨率 (uinput 触摸注入的坐标系).
+
+        与 set_display_resolution 的视频分辨率区分开:
+          - video_width/height  : 抓帧分辨率 (可能是 720p), 用于画面布局
+          - device_width/height : 设备物理分辨率 (如 1920x1080), 用于点击坐标
+
+        两者不等时, 点击坐标要乘input_scale 才能落到正确的物理位置.
+        """
+        if device_width <= 0 or device_height <= 0:
+            return
+        if device_width == self.device_video_width and device_height == self.device_video_height:
+            return
+        self.device_video_width = device_width
+        self.device_video_height = device_height
+        # 物理分辨率 / 抓帧分辨率
+        if self.video_width > 0 and self.video_height > 0:
+            self.input_scale_x = device_width / self.video_width
+            self.input_scale_y = device_height / self.video_height
+            print_log(LogLevel.INFO, self.log_title,
+                f"设备物理分辨率 {device_width}x{device_height} "
+                f"(抓帧 {self.video_width}x{self.video_height}) "
+                f"输入缩放 {self.input_scale_x:.4f}x{self.input_scale_y:.4f}")
+
     def set_display_resolution(self, video_width: int, video_height: int, canvas_width: int, canvas_height: int) -> Tuple[int, int, float]:
         """计算并设置显示分辨率 (等比 contain, 留黑边).
 
@@ -134,11 +161,28 @@ class DeviceController:
         if canvas_height <= 10:
             canvas_height = 600
         
+        # 注意: video_width/height 是抓帧分辨率, device_video_width/height 是设备物理分辨率.
+        # 两者可能不同 (如抓 720p 但设备 1080p) — 此时不能覆盖 device_video_*,
+        # 否则点击坐标会按抓帧坐标系发给 uinput, 导致点位偏移.
+        changed_size = (self.video_width != video_width or self.video_height != video_height)
         self.video_width = video_width
         self.video_height = video_height
-        # 保存原始设备尺寸 (用于 mouse 坐标转换)
-        self.device_video_width = video_width
-        self.device_video_height = video_height
+        # device_video_width/height 若尚未被 set_device_resolution 设置过, 兜底用视频分辨率
+        if self.device_video_width <= 0 or self.device_video_height <= 0:
+            self.device_video_width = video_width
+            self.device_video_height = video_height
+        # 重算输入缩放 (抓帧坐标 -> 设备物理坐标)
+        if video_width > 0 and video_height > 0:
+            new_sx = self.device_video_width / video_width
+            new_sy = self.device_video_height / video_height
+            if changed_size or new_sx != self.input_scale_x or new_sy != self.input_scale_y:
+                self.input_scale_x = new_sx
+                self.input_scale_y = new_sy
+                if new_sx != 1.0 or new_sy != 1.0:
+                    print_log(LogLevel.INFO, self.log_title,
+                        f"输入缩放 {new_sx:.4f}x{new_sy:.4f} "
+                        f"(设备 {self.device_video_width}x{self.device_video_height} "
+                        f"-> 抓帧 {video_width}x{video_height})")
         self.display_ratio = min(canvas_width / video_width, canvas_height / video_height)
         self.display_width = int(video_width * self.display_ratio)
         self.display_height = int(video_height * self.display_ratio)
@@ -624,8 +668,13 @@ class DeviceController:
         else:
             left = self.left
             top = self.top
+        # 先按 display_ratio 换算到抓帧坐标系, 再按 input_scale 换算到设备物理坐标系.
+        # 两步缺一不可: 少了 input_scale 会在抓帧分辨率 != 设备分辨率时点歪.
         device_x = int((window_x - left) / self.display_ratio)
         device_y = int((window_y - top) / self.display_ratio)
+        if self.input_scale_x != 1.0 or self.input_scale_y != 1.0:
+            device_x = int(device_x * self.input_scale_x)
+            device_y = int(device_y * self.input_scale_y)
         return device_x, device_y
 
     def _canvas_coords_from_event(self, event) -> Optional[Tuple[int, int]]:

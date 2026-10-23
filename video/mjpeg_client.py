@@ -62,6 +62,12 @@ class MjpegStreamClient:
         self.debug = debug
         
         self.is_connected: bool = False
+        # 断线回调 (设备重启/hdc 断开/心跳超时 时通知上层).
+        # 不设则上层 (GUI) 无法感知断线 -> 画面卡死但状态仍显示"已连接".
+        self.on_disconnected = None
+        self._disconnect_notified = False
+        # 连续拉取失败多少次判定链路断开 (设备重启/hdc 掉线)
+        self.MAX_CONSECUTIVE_FAILURES = 15
         self.is_streaming: bool = False
         
         # 与 VideoStreamClient 兼容的字段
@@ -137,7 +143,24 @@ class MjpegStreamClient:
                 print_log(LogLevel.WARN, self.log_title, f"无法解析首张图片: {e}")
             # 关键: 探测完立刻关闭连接,避免占着 device busybox httpd
             r.close()
+            # 查询设备物理分辨率 (jpeg_server 提供 /screen.info).
+            # 抓帧分辨率 != 设备分辨率时, 点击坐标需要换算, 否则点歪.
+            try:
+                from urllib.parse import urlparse as _up
+                _u = _up(self.url)
+                _info_url = f"{_u.scheme}://{_u.netloc}/screen.info"
+                _ri = requests.get(_info_url, timeout=5)
+                if _ri.status_code == 200:
+                    _j = _ri.json()
+                    self.config.device_width = int(_j.get("width", 0) or 0)
+                    self.config.device_height = int(_j.get("height", 0) or 0)
+                    print_log(LogLevel.INFO, self.log_title,
+                        f"设备物理分辨率 {self.config.device_width}x{self.config.device_height} "
+                        f"(抓帧 {self.config.width}x{self.config.height})")
+            except Exception as e:
+                print_log(LogLevel.WARN, self.log_title, f"获取设备分辨率失败(忽略): {e}")
             self.is_connected = True
+            self._disconnect_notified = False
             self.last_data_time = time.time()
             self.last_frame_time = time.time()
             self._start_workers()
@@ -222,6 +245,7 @@ class MjpegStreamClient:
                                               int(current_poll_ms * 1.3))
                     self.total_bytes += len(jpeg_bytes)
                     self.last_data_time = time.time()
+                    self._fail_count = 0
                     
                     # 设备端 snapshot_display 写 screen.jpeg.tmp + atomic mv 到 screen.jpeg,
                     # 与 busybox httpd 的 sendfile 之间有微小竞争窗口, 可能拿到截断字节.
@@ -297,9 +321,15 @@ class MjpegStreamClient:
                         http.client.RemoteDisconnected,
                         http.client.BadStatusLine,
                         http.client.IncompleteRead) as e:
-                    # 拉取失败时也更新 last_data_time, 防止监控线程误判超时.
-                    # 真正"心跳停止"的标志是 poll 线程退出, 不是 last_data_time.
-                    self.last_data_time = time.time()
+                    # 连续失败计数: 达到阈值说明链路真的断了 (设备重启/hdc 掉线),
+                    # 此时不能继续刷新 last_data_time — 否则心跳监控永远等不到超时,
+                    # 表现为"画面卡死 + 状态仍显示已连接".
+                    self._fail_count = getattr(self, "_fail_count", 0) + 1
+                    if self._fail_count < self.MAX_CONSECUTIVE_FAILURES:
+                        # 偶发失败 (设备端 atomic rename 竞争等) — 保持心跳新鲜, 继续重试
+                        self.last_data_time = time.time()
+                    else:
+                        self.last_data_time = 0.0  # 心跳归零 -> 监控线程立即判定断开
                     # 拉取失败 -> 关闭连接让下次重建, 短退避后立即重试.
                     # 旧实现用 POLL_INTERVAL_MS_MAX (600ms) + sleep 0.5s, 慢,
                     # 看起来像"连接成功 -> 立即黑屏". 设备端 atomic rename 是 ~150ms
@@ -310,7 +340,6 @@ class MjpegStreamClient:
                     current_poll_ms = min(self.POLL_INTERVAL_MS_MAX, 200)
                     time.sleep(0.05)  # 极短退避, 立即重试
                     # 关键: 即使 debug=False 也打印前 5 次失败 + 之后每 30 次, 避免静默卡死
-                    self._fail_count = getattr(self, "_fail_count", 0) + 1
                     if self._fail_count <= 5 or self._fail_count % 30 == 0:
                         print_log(LogLevel.WARN, self.log_title,
                             f"拉取失败 #{self._fail_count}: {type(e).__name__}: {e}")
@@ -343,7 +372,21 @@ class MjpegStreamClient:
         finally:
             self.is_streaming = False
             print_log(LogLevel.INFO, self.log_title, "轮询线程结束")
+        # 线程异常退出 = 链路已断, 通知上层 (GUI 会显示"连接已断开"并尝试恢复)
+        self._notify_disconnected("视频流读取线程退出")
     
+    def _notify_disconnected(self, reason: str) -> None:
+        """通知上层连接已断开 (幂等, 只通知一次)."""
+        if self._disconnect_notified:
+            return
+        self._disconnect_notified = True
+        cb = self.on_disconnected
+        if cb is not None:
+            try:
+                cb(reason)
+            except Exception as e:
+                print_log(LogLevel.WARN, self.log_title, f"断线回调异常: {e!r}")
+
     def _monitor_thread_func(self) -> None:
         """心跳超时监控"""
         print_log(LogLevel.INFO, self.log_title, "监控线程启动")
@@ -351,9 +394,15 @@ class MjpegStreamClient:
         try:
             while not self._stop_event.is_set() and self.is_connected:
                 current_time = time.time()
-                if self.frame_count > 0 and current_time - self.last_data_time > HEARTBEAT_TIMEOUT:
-                    print_log(LogLevel.ERROR, self.log_title,
-                        f"心跳超时 ({current_time - self.last_data_time:.1f}秒),断开连接")
+                # last_data_time == 0 表示 poll 线程连续失败已达阈值 (链路确认断开)
+                if self.frame_count > 0 and (
+                    self.last_data_time == 0.0
+                    or current_time - self.last_data_time > HEARTBEAT_TIMEOUT
+                ):
+                    reason = ("连续拉取失败" if self.last_data_time == 0.0
+                              else f"心跳超时 {current_time - self.last_data_time:.0f}秒无数据")
+                    print_log(LogLevel.ERROR, self.log_title, f"{reason},断开连接")
+                    self._notify_disconnected(reason)
                     self.disconnect()
                     break
                 # 用 wait 替代 sleep, 断开时能立即唤醒; 同时避免每次循环刷日志
