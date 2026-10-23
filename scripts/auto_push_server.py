@@ -85,6 +85,46 @@ def _root() -> str:
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _known_devices() -> list:
+    """已知的历史网络设备 (host:port).
+
+    来源:
+      1. 环境变量 OHCRCPY_TCONN (逗号分隔)
+      2. 本地缓存 ~/.ohscrcpy_devices (上次成功连接的设备, 由 GUI 写入)
+    """
+    out = []
+    env = os.environ.get("OHCRCPY_TCONN", "").strip()
+    if env:
+        out.extend(x.strip() for x in env.split(",") if x.strip())
+    cache = os.path.join(os.path.expanduser("~"), ".ohscrcpy_devices")
+    try:
+        with open(cache, "r", encoding="utf-8") as f:
+            for line in f:
+                sn = line.strip()
+                if sn and ":" in sn and sn not in out:
+                    out.append(sn)
+    except OSError:
+        pass
+    return out
+
+
+def _connect_known(hdc: HDCCommandExecutor) -> list:
+    """扫不到设备时, 尝试 tconn 已知网络设备.
+
+    网络设备的 hdc 连接不持久: 设备重启 / hdc 进程重启后 list targets 为空.
+    没有这一步, 自动推送会在启动时直接跳过 (日志: "没有已连接设备").
+    """
+    from core.arch_detector import ensure_connected
+    connected = []
+    for sn in _known_devices():
+        print(f"[auto-push] 尝试重连 {sn}")
+        if ensure_connected(hdc, sn):
+            connected.append(sn)
+        else:
+            print(f"[auto-push] 重连 {sn} 失败")
+    return connected
+
+
 def _list_targets(hdc: HDCCommandExecutor):
     """返回已连接设备 SN 列表.
 
@@ -227,6 +267,11 @@ def main() -> int:
 
     hdc = HDCCommandExecutor()
     targets = [args.device] if args.device else _list_targets(hdc)
+    if not targets:
+        # 扫不到设备 -> 尝试重连已知网络设备 (与 GUI 的自动重连逻辑一致)
+        reconnected = _connect_known(hdc)
+        if reconnected:
+            targets = _list_targets(hdc) or reconnected
     if not targets:
         print("[auto-push] 没有已连接设备")
         return 0
