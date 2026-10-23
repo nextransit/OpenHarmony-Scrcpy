@@ -12,7 +12,8 @@ import os
 from .constants import LogLevel
 from .logger import print_log
 from .hdc_executor import HDCCommandExecutor
-from .arch_detector import detect_device_arch, local_binary_arch, ensure_connected
+from .arch_detector import detect_device_arch, local_binary_arch
+from .selinux_helper import ensure_permissive
 
 
 class MjpegServerManager:
@@ -138,31 +139,13 @@ class MjpegServerManager:
     def _ensure_permissive(self) -> bool:
         """确保设备 SELinux 处于 Permissive (仅在必要时, 且失败不阻断).
 
-        部分 OHOS 设备在 Enforcing 下会拒绝 snapshot_display / 抓屏 API,
-        表现为抓帧失败或 jpeg_server 拿不到像素. 提前切到 Permissive 可避免.
-
-        规则:
-          - 已经是 Permissive -> 直接返回 True
-          - 设备不允许 setenforce (非 root / 无权限) -> 返回 False, 不阻断主流程
-          - OHCRCPY_NO_SETENFORCE=1 -> 跳过 (用户显式禁用)
+        详见 core/selinux_helper.py:
+          - 运行时 setenforce 0 (立即生效)
+          - 持久化 /system/etc/selinux/config (设备重启后仍生效)
+            只读根分区必须先 `mount -o remount,rw /`, 否则 toybox sed 报
+            "sed: no temp file"
         """
-        if os.environ.get("OHCRCPY_NO_SETENFORCE", "") == "1":
-            return False
-        r = self._exec("shell", "getenforce 2>/dev/null", timeout=5)
-        state = (r.get("stdout") or "").strip().lower()
-        if not state:
-            return False
-        if state == "permissive":
-            return True
-        if state != "enforcing":
-            return False
-        r2 = self._exec("shell", "setenforce 0 2>/dev/null; getenforce 2>/dev/null", timeout=8)
-        now = (r2.get("stdout") or "").strip().lower()
-        if now == "permissive":
-            print_log(LogLevel.WARN, self.log_title,
-                "设备 SELinux 为 Enforcing, 已自动切换到 Permissive (抓屏需要)")
-            return True
-        return False
+        return ensure_permissive(self.hdc, self.log_title)
 
     def _has_busybox(self) -> bool:
         """设备是否有 busybox (且支持 httpd applet)."""

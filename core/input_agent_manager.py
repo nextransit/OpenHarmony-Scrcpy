@@ -45,6 +45,7 @@ from .constants import LogLevel
 from .logger import print_log
 from .hdc_executor import HDCCommandExecutor
 from .arch_detector import detect_device_arch, local_binary_arch
+from .selinux_helper import ensure_permissive
 
 REMOTE_PATH = "/data/local/tmp/ohscrcpy_input_agent"
 
@@ -133,6 +134,13 @@ class InputAgentManager:
 
     def _start_agent(self) -> bool:
         """启动设备端常驻代理 (先清理旧进程)."""
+        # uinput 事件注入在 SELinux Enforcing 下可能被拒, 先确保 permissive.
+        # 失败不阻断 — 代理仍会启动, 注入是否生效由设备端决定.
+        try:
+            ensure_permissive(self.hdc, self.log_title)
+        except Exception as e:
+            print_log(LogLevel.WARN, self.log_title, f"SELinux 处理异常: {e!r}")
+
         sn = self.hdc.get_current_device()
         self.hdc.execute(["-t", sn, "shell", "pkill -9 -f ohscrcpy_input_agent 2>/dev/null"],
                          timeout=8)
