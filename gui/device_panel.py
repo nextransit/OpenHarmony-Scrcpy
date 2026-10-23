@@ -12,7 +12,16 @@ from typing import Callable, Optional, List
 
 from core import LogLevel, print_log
 from gui.theme import Theme, ICONS
-from gui.widgets import ModernButton
+from gui.ttk_bootstrap import (
+    make_button as tb_button,
+    make_combobox as tb_combobox,
+    make_frame as tb_frame,
+    make_label as tb_label,
+    SUCCESS_BOOTSTRAP,
+    SECONDARY_BOOTSTRAP,
+    DANGER_BOOTSTRAP,
+    INFO_BOOTSTRAP,
+)
 
 
 class DevicePanel:
@@ -33,75 +42,52 @@ class DevicePanel:
         self.frame: Optional[tk.Frame] = None
         self.device_var: Optional[tk.StringVar] = None
         self.device_combo: Optional[ttk.Combobox] = None
-        self.connect_btn: Optional[ModernButton] = None
+        self.connect_btn: Optional[object] = None
 
         self._configure_ttk_style()
         self._create_panel()
 
     def _configure_ttk_style(self) -> None:
-        """统一 ttk Combobox 风格."""
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")  # clam 是最可定制的内置主题
-        except tk.TclError:
-            pass
-        style.configure(
-            "OH.TCombobox",
-            fieldbackground=Theme.BG_ELEVATED,
-            background=Theme.BG_ELEVATED,
-            foreground=Theme.TEXT_PRIMARY,
-            arrowcolor=Theme.ACCENT,
-            bordercolor=Theme.BORDER,
-            lightcolor=Theme.BORDER,
-            darkcolor=Theme.BORDER,
-            selectbackground=Theme.ACCENT,
-            selectforeground=Theme.TEXT_ON_ACCENT,
-        )
-        style.map(
-            "OH.TCombobox",
-            fieldbackground=[("readonly", Theme.BG_ELEVATED)],
-            foreground=[("readonly", Theme.TEXT_PRIMARY)],
-        )
+        """ttkbootstrap 主题在 apply_theme() 已应用, 这里不再覆盖."""
+        pass
 
     def _create_panel(self) -> None:
-        frame = tk.LabelFrame(
-            self.parent, text="设备",
-            font=Theme.FONT_SUBTITLE,
-            bg=Theme.BG_PANEL, fg=Theme.TEXT_PRIMARY,
-            bd=1, relief=tk.FLAT,
-            labelanchor="nw",
-        )
+        # ttkbootstrap 容器 (圆角 + 主题色背景)
+        frame = tb_frame(self.parent, bootstyle="secondary")
         frame.pack(fill=tk.X, padx=8, pady=(8, 4))
         self.frame = frame
 
+        # 标题
+        tb_label(
+            frame, text="设备",
+            font=Theme.FONT_SUBTITLE, bootstyle="inverse-secondary",
+            anchor="w",
+        ).pack(fill=tk.X, padx=10, pady=(8, 4))
+
         self.device_var = tk.StringVar()
-        self.device_combo = ttk.Combobox(
-            frame, textvariable=self.device_var,
-            state="readonly", style="OH.TCombobox",
+        self.device_combo = tb_combobox(
+            frame, values=[], textvariable=self.device_var,
+            state="readonly", bootstyle="secondary",
         )
         self.device_combo.bind("<<ComboboxSelected>>", self.on_select)
-        self.device_combo.pack(fill=tk.X, padx=10, pady=(8, 6))
+        self.device_combo.pack(fill=tk.X, padx=10, pady=(0, 8))
 
-        btn_frame = tk.Frame(frame, bg=Theme.BG_PANEL)
+        # 按钮行
+        btn_frame = tb_frame(frame, bootstyle="")
         btn_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
 
-        btn_refresh = ModernButton(
-            btn_frame, icon=Theme.__dict__.get("FONT_ICON", "") and "↻",  # 借用 icon 字段
-            text="刷新", command=self.on_refresh,
-            style="secondary", width=68, height=32,
+        self.refresh_btn = tb_button(
+            btn_frame, text="刷新", icon="↻",
+            command=self.on_refresh,
+            bootstyle=SECONDARY_BOOTSTRAP, width=8,
         )
-        # ModernButton 实际需要 icon_only=False 时显示 text
-        btn_refresh._icon_only = False
-        btn_refresh.set_text("刷新")
-        btn_refresh._draw()
-        btn_refresh.pack(side=tk.LEFT, padx=(0, 6))
+        self.refresh_btn.pack(side=tk.LEFT, padx=(0, 6))
 
-        self.connect_btn = ModernButton(
-            btn_frame, text="连接", icon=ICONS["connect"], command=self.on_connect,
-            style="success", width=88, height=32,
+        self.connect_btn = tb_button(
+            btn_frame, text="连接", icon=ICONS["connect"],
+            command=self.on_connect,
+            bootstyle=SUCCESS_BOOTSTRAP, width=10,
         )
-        self.connect_btn._icon_only = False
-        self.connect_btn._draw()
         self.connect_btn.pack(side=tk.RIGHT)
 
     def update_devices(self, devices: List[str], current_device: str = None) -> None:
@@ -120,22 +106,22 @@ class DevicePanel:
 
     def set_connect_button_state(self, text: str, bg_color: str) -> None:
         """兼容旧 API. 自动切 icon + 文字 + 颜色:
-          未连接 (text='连接'): icon='⏵' style='success' (绿)
-          已连接 (text='断开'): icon='⏹' style='danger'  (红)
+          未连接 (text='连接'): icon='⏵' bootstyle='success' (绿)
+          已连接 (text='断开'): icon='⏹' bootstyle='danger'  (红)
         """
         connected = '断开' in text
         if connected:
-            self.connect_btn._icon = ICONS["disconnect"]
-            self.connect_btn._text = '断开'
-            self.connect_btn._style = 'danger'
+            new_text = '⏹ 断开'
+            new_bootstyle = DANGER_BOOTSTRAP
         else:
-            self.connect_btn._icon = ICONS["connect"]
-            self.connect_btn._text = '连接'
-            self.connect_btn._style = 'success'
-        self.connect_btn._current_colors = self.connect_btn._colors_for('normal')
-        self.connect_btn._draw()
+            new_text = '⏵ 连接'
+            new_bootstyle = SUCCESS_BOOTSTRAP
+        try:
+            self.connect_btn.configure(text=new_text, bootstyle=new_bootstyle)
+        except Exception:
+            pass
 
-    def get_frame(self) -> tk.LabelFrame:
+    def get_frame(self) -> object:
         return self.frame
 
     def set_selected_device(self, display_name: str) -> None:
