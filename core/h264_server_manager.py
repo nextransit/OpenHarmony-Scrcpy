@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright (c) 2026 luodh.
+# Copyright (c) 2026 BenZhou.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -28,16 +28,19 @@ from typing import Optional
 from .constants import LogLevel
 from .logger import print_log
 from .hdc_executor import HDCCommandExecutor
+from .arch_detector import detect_device_arch, local_binary_arch
 
 
 class H264ServerManager:
     """在设备端部署 oh264_streamer (H.264 Annex-B HTTP bytestream 服务)."""
 
     DEFAULT_PORT = 27191
-    DEFAULT_WIDTH = 720
-    DEFAULT_HEIGHT = 1280
+    # 横屏 1280x720: 实测 loongarch Surface 模式 28fps @720p;
+    # 竖屏 720x1280 会让抓屏宽高不匹配设备实际比例.
+    DEFAULT_WIDTH = 1280
+    DEFAULT_HEIGHT = 720
     DEFAULT_FPS = 30
-    DEFAULT_BITRATE = 1500000
+    DEFAULT_BITRATE = 8000000
 
     def __init__(self, hdc_executor: HDCCommandExecutor) -> None:
         self.hdc = hdc_executor
@@ -49,6 +52,7 @@ class H264ServerManager:
         self.log_title = "H264服务"
         self.server_process_pid: Optional[int] = None
         self.installed: bool = False
+        self.device_arch: str = ""
 
     def setup(self, port: int = DEFAULT_PORT, width: int = DEFAULT_WIDTH,
               height: int = DEFAULT_HEIGHT, fps: int = DEFAULT_FPS,
@@ -101,17 +105,68 @@ class H264ServerManager:
         return self.hdc.execute(list(args), timeout=timeout)
 
     def _local_binary_path(self) -> str:
-        """本地 (PC) 上的 oh264_streamer 二进制路径."""
-        return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "device", "oh264_streamer")
+        """本地 (PC) 上的 oh264_streamer 二进制路径.
+
+        按设备架构选择:
+          aarch64    -> device/oh264_streamer
+          arm        -> device/oh264_streamer_arm
+          loongarch64-> device/oh264_streamer_loongarch
+        """
+        device_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                  "device")
+        arch = getattr(self, "device_arch", "") or "aarch64"
+        names = {
+            "aarch64": "oh264_streamer",
+            "arm": "oh264_streamer_arm",
+            "loongarch64": "oh264_streamer_loongarch",
+        }
+        name = names.get(arch, "oh264_streamer")
+        path = os.path.join(device_dir, name)
+        if os.path.exists(path):
+            return path
+        # 架构专属二进制缺失时回退到默认, 但要记录架构差异
+        fallback = os.path.join(device_dir, "oh264_streamer")
+        if arch != "aarch64" and os.path.exists(fallback):
+            print_log(LogLevel.WARN, self.log_title,
+                f"未找到架构 [{arch}] 专属二进制 {name}, 回退到 {fallback} "
+                f"(架构不匹配会导致设备端 'not executable')")
+        return fallback
+
+    def _needs_home_flag(self) -> bool:
+        """本地二进制是否为 oh264_capture (需要 -H HOME_SCREEN).
+
+        oh264_capture 用 OH_AVScreenCapture 抓屏, 必须指定 HOME_SCREEN 才能工作;
+        旧版 oh264_streamer (造测试图) 不支持该参数.
+        """
+        try:
+            path = self._local_binary_path()
+            with open(path, "rb") as f:
+                head = f.read(1 << 20)
+            return b"StartScreenCaptureWithSurface" in head
+        except Exception:
+            return False
 
     def _install_binary(self) -> bool:
-        """推送 oh264_streamer 到设备 /system/bin/."""
+        """推送 oh264_streamer 到设备 /system/bin/ (按架构自动选二进制)."""
+        if not getattr(self, "device_arch", ""):
+            self.device_arch = detect_device_arch(self.hdc, self.hdc.get_current_device())
+            if self.device_arch:
+                print_log(LogLevel.INFO, self.log_title, f"设备架构: {self.device_arch}")
+
         local = self._local_binary_path()
         if not os.path.exists(local):
             print_log(LogLevel.ERROR, self.log_title,
                 f"未找到本地二进制: {local}. 需要先按 docs/H264_NDK_BUILD.md 编译.")
             return False
+
+        # 架构一致性校验 — 不匹配时设备内核会拒绝执行
+        actual = local_binary_arch(local)
+        if actual and self.device_arch and actual != self.device_arch:
+            print_log(LogLevel.ERROR, self.log_title,
+                f"二进制架构 [{actual}] 与设备架构 [{self.device_arch}] 不匹配, 拒绝推送: {local}")
+            return False
+        print_log(LogLevel.INFO, self.log_title,
+            f"推送二进制: {local} (arch={actual or '未知'})")
 
         # 挂载系统为读写 (与 MJPEG 部署一致)
         self._exec("target", "mount")
@@ -135,7 +190,12 @@ class H264ServerManager:
         time.sleep(0.5)
 
         # 后台启动 (-p port -w width -h height -f fps -b bitrate)
-        cmd = f"nohup /system/bin/oh264_streamer -p {self.port} -w {self.width} -h {self.height} -f {self.fps} -b {self.bitrate} > /data/local/tmp/oh264_streamer.log 2>&1 &"
+        # loongarch 版是 oh264_capture (原生抓屏 + Surface 零拷贝), 需要 -H (HOME_SCREEN).
+        # aarch64 版是 oh264_streamer, 不认 -H — 用二进制能力探测决定是否加.
+        extra = " -H" if self._needs_home_flag() else ""
+        cmd = (f"nohup /system/bin/oh264_streamer -p {self.port} -w {self.width} "
+               f"-h {self.height} -f {self.fps} -b {self.bitrate}{extra} "
+               f"> /data/local/tmp/oh264_streamer.log 2>&1 &")
         self._exec("shell", cmd, timeout=5)
         time.sleep(1.5)  # 给设备端启动时间
 

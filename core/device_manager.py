@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright (c) 2026 luodh0157.
+# Copyright (c) 2026 BenZhou.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -17,12 +17,14 @@
 OpenHarmony_Scrcpy 设备管理器
 """
 
+import os
 from dataclasses import dataclass
 from typing import Optional, List
 
 from .constants import DEFAULT_PORT, LogLevel
 from .logger import print_log
 from .hdc_executor import HDCCommandExecutor
+from .arch_detector import ensure_connected
 
 
 @dataclass
@@ -49,30 +51,90 @@ class DeviceManager:
     def discover_devices(self) -> List[DeviceInfo]:
         """发现可用设备"""
         result = self.hdc.execute(["list", "targets"], False)
-        if not result["success"]:
-            return []
-        
         devices = []
-        lines = result["stdout"].strip().split('\n')
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            parts = line.split()
-            if not parts:
-                continue
-            
-            sn = parts[0].strip()
-            if sn == "[Empty]":
-                continue
-            model = self.get_device_param(sn, "const.product.model")
-            manufacturer = self.get_device_param(sn, "const.product.manufacturer")
-            devices.append(DeviceInfo(sn=sn, model=model, manufacturer=manufacturer))
-        
+        if result["success"]:
+            lines = result["stdout"].strip().split('\n')
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if not parts:
+                    continue
+                sn = parts[0].strip()
+                if sn == "[Empty]":
+                    continue
+                model = self.get_device_param(sn, "const.product.model")
+                manufacturer = self.get_device_param(sn, "const.product.manufacturer")
+                devices.append(DeviceInfo(sn=sn, model=model, manufacturer=manufacturer))
+
+        # 没扫到设备时, 尝试重连上次用过的网络设备 (host:port 形式).
+        # 网络设备的 hdc 连接不持久: 设备重启 / hdc 进程重启后 list targets 为空,
+        # 必须重新 tconn 才能继续用.
+        if not devices:
+            for sn in self._known_network_devices():
+                print_log(LogLevel.INFO, self.log_title, f"未扫到设备, 尝试重连 {sn}")
+                if ensure_connected(self.hdc, sn):
+                    result = self.hdc.execute(["list", "targets"], False)
+                    if result["success"]:
+                        for line in result["stdout"].strip().split('\n'):
+                            line = line.strip()
+                            if not line or line == "[Empty]":
+                                continue
+                            parts = line.split()
+                            if not parts:
+                                continue
+                            sn2 = parts[0].strip()
+                            model = self.get_device_param(sn2, "const.product.model")
+                            manufacturer = self.get_device_param(sn2, "const.product.manufacturer")
+                            devices.append(DeviceInfo(sn=sn2, model=model, manufacturer=manufacturer))
+                    if devices:
+                        break
+
         self.devices = devices
         return devices
+
+    def _known_network_devices(self) -> List[str]:
+        """已知的历史网络设备 (host:port).
+
+        来源:
+          1. 环境变量 OHCRCPY_TCONN (手动指定, 逗号分隔)
+          2. 本地缓存文件 ~/.ohscrcpy_devices (上次成功连接的设备)
+        """
+        out: List[str] = []
+        env = os.environ.get("OHCRCPY_TCONN", "").strip()
+        if env:
+            out.extend(x.strip() for x in env.split(",") if x.strip())
+        cache = os.path.join(os.path.expanduser("~"), ".ohscrcpy_devices")
+        try:
+            with open(cache, "r", encoding="utf-8") as f:
+                for line in f:
+                    sn = line.strip()
+                    if sn and ":" in sn and sn not in out:
+                        out.append(sn)
+        except OSError:
+            pass
+        return out
+
+    def remember_device(self, sn: str) -> None:
+        """记住成功连接的网络设备, 供下次启动时自动重连."""
+        if not sn or ":" not in sn:
+            return
+        cache = os.path.join(os.path.expanduser("~"), ".ohscrcpy_devices")
+        known: List[str] = []
+        try:
+            with open(cache, "r", encoding="utf-8") as f:
+                known = [x.strip() for x in f if x.strip()]
+        except OSError:
+            pass
+        if sn in known:
+            return
+        known.append(sn)
+        try:
+            with open(cache, "w", encoding="utf-8") as f:
+                f.write("\n".join(known[-20:]) + "\n")
+        except OSError:
+            pass
     
     def get_device_param(self, sn: str, param: str) -> str:
         """获取指定设备系统属性"""

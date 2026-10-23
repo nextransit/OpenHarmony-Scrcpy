@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright (c) 2026 luodh0157.
+# Copyright (c) 2026 BenZhou.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -26,6 +26,7 @@ from typing import Optional
 from .constants import LogLevel
 from .logger import print_log, get_log_file
 from .hdc_executor import HDCCommandExecutor
+from .arch_detector import detect_device_arch, find_server_binary, verify_binary_arch
 
 
 class ServerManager:
@@ -37,6 +38,7 @@ class ServerManager:
         self.manufacturer = manufacturer
         self.log_title = "服务端管理器"
         
+        self.device_arch: str = ""
         self.server_exe_file = self._get_resource_path("ohscrcpy_server", manufacturer)
         self.server_cfg_file = self._get_resource_path("ohscrcpy_server.cfg")
     
@@ -68,11 +70,49 @@ class ServerManager:
         self.manufacturer = manufacturer
         self.server_exe_file = self._get_resource_path("ohscrcpy_server", manufacturer)
         self.server_cfg_file = self._get_resource_path("ohscrcpy_server.cfg")
+
+    def select_binary_for_device(self) -> str:
+        """按设备实际架构选择服务端二进制 (自动 push 的前置步骤).
+
+        流程:
+          1. 探测设备架构 (uname -m)
+          2. 按架构 + 厂商查找本地二进制
+          3. 校验二进制架构与设备一致 (不一致直接拒绝, 避免设备端
+             'not executable: 64-bit ELF file')
+
+        Returns:
+            选中的本地二进制路径; 失败返回空字符串.
+        """
+        if not self.device_arch:
+            self.device_arch = detect_device_arch(self.hdc, self.hdc.get_current_device())
+        if not self.device_arch:
+            print_log(LogLevel.WARN, self.log_title,
+                "设备架构探测失败, 回退到默认二进制")
+            return self.server_exe_file
+
+        path = find_server_binary(self.device_arch, self.manufacturer)
+        if not path:
+            print_log(LogLevel.ERROR, self.log_title,
+                f"未找到架构 [{self.device_arch}] 对应的服务端二进制")
+            return ""
+
+        if not verify_binary_arch(path, self.device_arch):
+            print_log(LogLevel.ERROR, self.log_title,
+                f"二进制 [{path}] 与设备架构 [{self.device_arch}] 不匹配, 拒绝推送")
+            return ""
+
+        self.server_exe_file = path
+        return path
     
     def install_server(self) -> bool:
         """安装服务端"""
         print_log(LogLevel.INFO, self.log_title, f"开始安装...")
-        
+
+        # 按设备架构自动选择匹配的二进制 (自动 push)
+        selected = self.select_binary_for_device()
+        if not selected:
+            return False
+
         if not os.path.exists(self.server_exe_file):
             print_log(LogLevel.FATAL, self.log_title, f"错误: {self.server_exe_file} 文件不存在")
             return False
