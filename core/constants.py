@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright (c) 2026 luodh0157.
+# Copyright (c) 2026 BenZhou.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -20,8 +20,8 @@ OpenHarmony_Scrcpy 常量与枚举定义
 from enum import IntEnum, auto
 
 # ==================== 项目信息 ====================
-AUTHOR = "luodh0157"
-PROJECT_URL = "https://gitcode.com/luodh0157/OpenHarmony_Scrcpy"
+AUTHOR = "BenZhou"
+PROJECT_URL = "https://gitcode.com/BenZhou/OpenHarmony_Scrcpy"
 VERSION = "v2.3.1"
 
 # ==================== 网络配置 ====================
@@ -29,7 +29,7 @@ DEFAULT_PORT = 27183
 HOST = "127.0.0.1"
 
 # ==================== 心跳配置 ====================
-HEARTBEAT_TIMEOUT = 60.0  # MJPEG 模式: 设备端 httpd 慢, 容错窗口放大  # 心跳超时时间（秒）
+HEARTBEAT_TIMEOUT = float(__import__('os').environ.get('OHCRCPY_HEARTBEAT_TIMEOUT', '60'))  # MJPEG 模式: 设备端 httpd 慢, 容错窗口放大  # 心跳超时时间（秒）
 HEARTBEAT_INTERVAL = 2.0  # 心跳发送间隔（秒）
 
 # ==================== 数据包配置 ====================

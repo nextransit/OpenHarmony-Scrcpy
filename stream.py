@@ -49,7 +49,7 @@ def main():
     r = hdc(*prefix, "shell", f"grep -c ohscrcpy_video /proc/net/unix 2>/dev/null; pgrep -f {DEVICE_PATH} | head -1")
     print("  服务端:", (r.stdout or "").strip() or "未确认，继续尝试")
 
-    print("[5/5] 连接 127.0.0.1:27183 并解码（模拟 luodh 客户端握手）")
+    print("[5/5] 连接 127.0.0.1:27183 并解码（模拟 BenZhou 客户端握手）")
     s = socket.socket(); s.settimeout(8)
     try:
         s.connect(("127.0.0.1", LOCAL_PORT))

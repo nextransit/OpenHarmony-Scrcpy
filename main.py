@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# Copyright (c) 2026 luodh0157.
+# Copyright (c) 2026 BenZhou.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -67,7 +67,7 @@ def main() -> NoReturn:
     init_logger()
 
     print("="*84)
-    print(" "*15, f"OpenHarmony_Scrcpy Client - {VERSION} (author: luodh0157)", " "*15)
+    print(" "*15, f"OpenHarmony_Scrcpy Client - {VERSION} (author: BenZhou)", " "*15)
     print("="*84)
 
     log_file = get_log_file()

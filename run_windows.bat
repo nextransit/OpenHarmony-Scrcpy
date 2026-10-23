@@ -41,5 +41,5 @@ if not defined OHCRCPY_MJPEG_WIDTH set OHCRCPY_MJPEG_WIDTH=1080
 if not defined OHCRCPY_MJPEG_HEIGHT set OHCRCPY_MJPEG_HEIGHT=1920
 
 REM Windows 上 PATH 已含 hdc 子目录 (hdc 在 Windows/x64/), 通过 set_environment() 在 Python 内设置
-echo == OHScrcpy Windows 启动 (luodh 版 v2.3) ==
+echo == OHScrcpy Windows 启动 (BenZhou 版 v2.3) ==
 "%PY%" "%CD%\main.py" %*
