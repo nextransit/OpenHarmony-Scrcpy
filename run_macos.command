@@ -90,10 +90,15 @@ if [ "${OHCRCPY_AUTO_PUSH:-1}" = "1" ]; then
     fi
 fi
 
-# 单实例
-if pgrep -f "$PY.*main.py" > /dev/null; then
+# 单实例.
+# 注意: 不能用 "$PY.*main.py" 这种带绝对路径的模式 ——
+# 同一份代码可能在不同目录各有一份 (如 ~/gitlab/... 和 ~/Desktop/work/...),
+# 路径绑定的模式匹配不到另一个目录的实例, 结果两个 GUI 同时跑,
+# 互相踢掉设备端 jpeg_server, 表现为"无法连接到服务端".
+# 改成匹配 "python* main.py" 这个稳定特征, 跨目录也能清掉.
+if pgrep -f "python.*main\.py" > /dev/null 2>&1; then
     echo "[run_macos] 检测到旧实例, 自动关闭..."
-    pkill -9 -f "$PY.*main.py" 2>/dev/null || true
+    pkill -9 -f "python.*main\.py" 2>/dev/null || true
     sleep 1
 fi
 

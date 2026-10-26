@@ -1531,10 +1531,17 @@ class MainWindow:
                 else:
                     self._update_device_status("连接失败")
                     self._defer_to_main(_restore_connect_button)
+                    # 给出可诊断的原因, 而不是笼统的"无法连接到服务端".
+                    # 常见原因: 设备端服务没起来 / 端口被别的实例占用 /
+                    # 设备 IP 变了 (网络设备) / 分辨率协商失败.
+                    reason = self._describe_connect_failure(connect_port)
                     self._defer_to_main(lambda: messagebox.showinfo("连接失败",
-                        "无法连接到服务端！请检查:\n"
-                        "1. 服务端是否在设备上运行\n"
-                        "2. 服务端口是否正确"))
+                        "无法连接到服务端！\n\n"
+                        f"原因: {reason}\n\n"
+                        "可尝试:\n"
+                        "1. 重新点击连接 (会自动重新部署设备端服务)\n"
+                        "2. 检查设备 IP 是否变化 (网络设备重启后会变)\n"
+                        "3. 确认没有另一个 ohscrcpy 实例在运行"))
                     return
                 
             except Exception as e:
@@ -1580,6 +1587,27 @@ class MainWindow:
             print_log(LogLevel.INFO, self.log_title, f"服务端已在运行")
         return True
     
+    def _describe_connect_failure(self, port: int) -> str:
+        """连接失败时给出可诊断的原因."""
+        try:
+            # 1) 设备端服务是否在跑
+            r = self.hdc_executor.execute(
+                ["-t", self.device_manager.get_current_device().sn,
+                 "shell", "pidof ohscrcpy_jpeg_server 2>/dev/null"], timeout=8)
+            if not (r.get("stdout") or "").strip():
+                return "设备端截图服务未运行 (已尝试自动部署, 可能部署失败)"
+            # 2) 端口是否可达
+            import socket as _socket
+            host = getattr(self.connection_manager, "stream_host", "127.0.0.1")
+            try:
+                probe = _socket.create_connection((host, port), timeout=3)
+                probe.close()
+                return f"端口 {host}:{port} 可达但连接被拒 (可能有其它实例抢占设备端服务)"
+            except OSError as e:
+                return f"无法连接 {host}:{port} ({e.__class__.__name__})"
+        except Exception as e:
+            return f"诊断失败: {e!r}"
+
     def _disconnect_device(self) -> None:
         """断开设备"""
         if self.connection_manager is not None:
