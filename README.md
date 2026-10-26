@@ -103,7 +103,7 @@ ohscrcpy/
 ├── core/
 │   ├── platform_utils.py    # ← 跨平台核心 (detect_platform / get_hdc_path / setup_environment)
 │   ├── hdc_executor.py      # hdc 命令执行器 (自动 fallback 到 platform_utils)
-│   ├── arch_detector.py     # ← 设备架构探测 (aarch64/arm/loongarch64/x86_64) + tconn 自动重连
+│   ├── arch_detector.py     # ← 设备架构探测 (aarch64/arm/loongarch64/x86_64) + tconn 连接设备
 │   ├── codec_detector.py    # ← 设备编码能力探测 (读 codec_caps.xml 自动选 H.264/MJPEG)
 │   ├── selinux_helper.py    # ← SELinux 运行时切换 + 持久化 (只读根分区处理)
 │   ├── input_agent_manager.py # ← 设备端常驻输入代理 (低延迟点击)
@@ -159,7 +159,8 @@ from core.platform_utils import (
 4. 客户端**直连设备 IP**(免 hdc 端口转发,延迟更低且更稳定)
 
 网络设备注意:设备的 hdc 连接**不持久**,设备重启或 hdc 进程重启后会丢失.
-客户端会记住上次成功连接的设备(`~/.ohscrcpy_devices`),启动时自动 `tconn` 重连.
+程序**不记忆**上次连过的设备地址(旧 IP 常常早已下线). 需要固定连接时用
+`OHCRCPY_TCONN=host:port` 显式指定, 启动时会 `tconn` 该地址.
 
 #### 设备端服务
 
@@ -285,7 +286,7 @@ bash scripts/build_h264_streamer_loongarch.sh # -> device/oh264_streamer_loongar
 |---|---|
 | **"无法连接到服务端"** | 可能有两个实例在跑互相踢设备端服务;启动脚本会跨目录自动清理旧实例. 也可跑 `scripts/verify_perf.sh` 诊断 |
 | **网络断开后没反应** | 已修复: 断线秒级检测并自动恢复. 心跳超时可用 `OHCRCPY_HEARTBEAT_TIMEOUT` 调 |
-| **设备连不上** | 网络设备的 hdc 连接不持久,设备重启后 IP 可能变化. 程序会自动 `tconn` 上次连接的设备;也可 `OHCRCPY_TCONN=host:port` 指定 |
+| **设备连不上** | 网络设备的 hdc 连接不持久,设备重启后 IP 可能变化. 用 `OHCRCPY_TCONN=host:port` 显式指定要连的设备 (程序不再自动重连历史设备) |
 | 画面卡住不动 | 检查设备端 `jpeg_server` 是否存活: `hdc shell pidof ohscrcpy_jpeg_server` |
 | 画面分辨率不对 | 默认按设备物理分辨率抓帧;可用 `OHCRCPY_MJPEG_WIDTH/HEIGHT` 固定 |
 | 点击很慢 | 已修复: 设备端常驻输入代理, ~380ms → ~90ms. 确认代理在跑: `hdc shell pidof ohscrcpy_input_agent` |
