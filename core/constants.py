@@ -22,7 +22,7 @@ from enum import IntEnum, auto
 # ==================== 项目信息 ====================
 AUTHOR = "BenZhou"
 PROJECT_URL = "https://github.com/nextransit/OpenHarmony-Scrcpy"
-VERSION = "v2.3.1"
+VERSION = "v2.3.2"
 
 # ==================== 网络配置 ====================
 DEFAULT_PORT = 27183
