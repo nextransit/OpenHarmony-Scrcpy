@@ -904,6 +904,14 @@ class MainWindow:
         """连接状态变化回调"""
         was_connected = self.is_connected
         self.is_connected = (state == ConnectionState.CONNECTED)
+        # 记录断线原因 (connection_manager 在视频流断开时写入)
+        self._last_disconnect_reason = ""
+        if not self.is_connected:
+            try:
+                self._last_disconnect_reason = getattr(
+                    self.connection_manager, "disconnect_reason", "") or ""
+            except Exception:
+                pass
         self._defer_to_main(lambda: self._update_connection_ui(was_connected))
 
     def _update_connection_ui(self, was_connected: bool = False) -> None:
@@ -935,16 +943,27 @@ class MainWindow:
 
         # 设备异常掉线 (之前是已连接状态) -> 明确提示 + 冻结画面标记
         if was_connected:
+            reason = getattr(self, "_last_disconnect_reason", "") or ""
+            # 把底层原因翻译成用户能懂的话
+            if "通信错误" in reason or "ConnectionReset" in reason \
+                    or "RemoteDisconnected" in reason or "Connection refused" in reason:
+                detail = "网络通信中断"
+            elif "心跳超时" in reason:
+                detail = "设备无响应"
+            elif "服务端关闭" in reason:
+                detail = "设备端服务已停止"
+            else:
+                detail = "设备连接已断开"
             self.connection_status_label.config(text="连接已断开", bootstyle="danger")
-            self._update_device_status("设备连接已断开")
-            self._show_link_lost_overlay()
+            self._update_device_status(detail)
+            self._show_link_lost_overlay(detail)
             # 自动恢复: 设备可能重启, hdc 需要重新 tconn
             self._schedule_auto_recover()
         else:
             self.connection_status_label.config(text="未连接", bootstyle="danger")
 
-    def _show_link_lost_overlay(self) -> None:
-        """画面上叠加"连接已断开"提示 (避免用户以为画面卡死)."""
+    def _show_link_lost_overlay(self, detail: str = "设备连接已断开") -> None:
+        """画面上叠加断线提示 (避免用户以为画面卡死)."""
         try:
             if self.video_canvas is None:
                 return
@@ -955,7 +974,7 @@ class MainWindow:
             self.video_canvas.delete("link_lost")
             self.video_canvas.create_text(
                 w // 2, h // 2,
-                text="设备连接已断开\n正在尝试自动恢复…",
+                text=f"{detail}\n正在尝试自动恢复…",
                 fill="#e74c3c", font=("Helvetica", 16, "bold"),
                 tags="link_lost",
             )
@@ -1026,6 +1045,9 @@ class MainWindow:
             return
 
         print_log(LogLevel.INFO, self.log_title, f"自动恢复连接: {sn}")
+        # 恢复过程中给用户可见进度 (否则用户只看到"正在尝试自动恢复…"干等)
+        self._update_device_status("正在重连设备…")
+        self._show_link_lost_overlay("正在重连设备…")
 
         # 1) hdc 重连 (设备重启后目标会消失, 需要重新 tconn)
         try:
@@ -1035,6 +1057,7 @@ class MainWindow:
             print_log(LogLevel.WARN, self.log_title, f"自动恢复: hdc 重连失败: {e!r}")
 
         # 2) 刷新设备列表 (设备重启后 display_name/model 可能变化)
+        self._update_device_status("正在恢复设备连接…")
         try:
             self.device_manager.devices = self.device_manager.discover_devices()
             print_log(LogLevel.INFO, self.log_title,

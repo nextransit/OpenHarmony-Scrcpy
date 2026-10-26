@@ -22,8 +22,14 @@ class MjpegServerManager:
     DEFAULT_PORT = 27190
     # 默认横屏 960x540: 实测 loongarch 设备 snapshot_display 抓帧上限约 6-13fps,
     # 降低分辨率 + 缩短间隔后客户端实测 16-20fps (原 1080x1920 是竖屏值, 会写反)
-    DEFAULT_WIDTH = 960
-    DEFAULT_HEIGHT = 540
+    # 默认抓帧分辨率.
+    # 实测 (真机 loongarch 8 核): snapshot_display 单次耗时与分辨率几乎无关
+    # (1920x1080 343ms / 1280x720 300ms / 960x540 314ms / 640x360 352ms),
+    # 瓶颈是进程启动而非像素量. 所以默认直接用设备物理分辨率 (最高画质),
+    # 不再为了帧率牺牲清晰度.
+    # 想降分辨率时用 OHCRCPY_MJPEG_WIDTH/HEIGHT 覆盖.
+    DEFAULT_WIDTH = 0      # 0 = 自动 (用设备物理分辨率)
+    DEFAULT_HEIGHT = 0
     DEFAULT_INTERVAL_S = 0.05
     # 抓帧并发数: 实测 loongarch 8 核设备上, 单路 snapshot_display ~174ms
     # (进程启动为主, 与分辨率几乎无关), 串行上限 ~1.8fps (MJPEG 流实测).
@@ -118,6 +124,15 @@ class MjpegServerManager:
         if not self._setup_port_forward(port, port):
             print_log(LogLevel.ERROR, self.log_title, "端口转发建立失败")
             return False
+
+        # 自动分辨率: width/height 为 0 时传 0 给设备端,
+        # jpeg_server 启动时自己探测物理分辨率并按其抓帧 (最高画质).
+        # 依据: 实测 snapshot_display 耗时与分辨率几乎无关, 提分辨率几乎不损失帧率.
+        if self.width <= 0 or self.height <= 0:
+            self.width = 0
+            self.height = 0
+            print_log(LogLevel.INFO, self.log_title,
+                "自动分辨率: 由设备端探测物理分辨率 (最高画质)")
 
         # 客户端应连接的地址: 网络设备优先直连 (免 hdc fport 转发,
         # 实测直连延迟 0.02ms vs fport 15-57ms, 且 hdc 转发机制在设备上不稳定).

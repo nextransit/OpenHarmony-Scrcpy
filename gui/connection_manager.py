@@ -61,6 +61,8 @@ class ConnectionManager:
         self._forwarded_port: int = -1
         
         self.log_title = "连接管理器"
+        # 最近一次断线原因 (供 GUI 显示明确提示)
+        self.disconnect_reason: str = ""
         # 视频流主机: 默认 127.0.0.1 (走 hdc fport 转发).
         # 网络设备可设为设备 IP 直连, 免掉 fport 转发的 15-57ms 开销与不稳定性.
         # 必须在 _init_video_client() 之前赋值 — 客户端构造时就绑定了 host.
@@ -102,8 +104,10 @@ class ConnectionManager:
         vc.on_disconnected = self._on_video_disconnected
 
     def _on_video_disconnected(self, reason: str = "") -> None:
-        """视频流断开 (设备掉线/重启/心跳超时)."""
+        """视频流断开 (设备掉线/重启/心跳超时/通信错误)."""
         print_log(LogLevel.WARN, self.log_title, f"视频流断开: {reason}")
+        # 保存断线原因, GUI 用来给用户明确的提示 (而不是笼统的"连接已断开")
+        self.disconnect_reason = reason or "连接已断开"
         # 状态切到 DISCONNECTED, 触发 on_state_changed -> GUI 更新 UI
         self._set_state(ConnectionState.DISCONNECTED)
 

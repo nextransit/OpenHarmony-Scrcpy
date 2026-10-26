@@ -51,6 +51,33 @@ class MjpegStreamClient:
     POLL_INTERVAL_MS_MIN = 50    # 最快 50ms (尽量贴近设备截图节奏)
     POLL_INTERVAL_MS_MAX = 600   # 最慢 600ms (网络/设备很慢时让出)
     POLL_INTERVAL_MS = 100       # 起步 100ms, 然后自适应调整
+
+    # ---- 自适应分辨率 ----
+    # 依据实测: snapshot_display 耗时与分辨率几乎无关 (1920x1080 与 640x360 同为 ~340ms),
+    # 瓶颈是进程启动; 但传输带宽与分辨率平方成正比:
+    #     960x540  @16fps -> 48 Mbps | 1280x720 @16fps -> 85 Mbps | 1920x1080 @16fps -> 191 Mbps
+    # 所以按实测接收速率自动降级, 保证画面流畅优先于清晰度.
+    AUTO_RES_ENABLED = True
+    # 降级阶梯 (从高到低)
+    AUTO_RES_LADDER = [(1920, 1080), (1280, 720), (960, 540), (640, 360)]
+    # 低于该速率 (Mbps) 判定带宽不足, 降一级.
+    # 实测 1920x1080 @ 18fps 只有 43 Mbps (帧 208KB), 所以阈值按分辨率分档:
+    #   1080p 需要 >= 45 Mbps | 720p >= 25 | 540p >= 12 | 360p >= 5
+    # 固定阈值会让 1080p 明明够用却被误判成"带宽不足"而降级.
+    # 实测 (6 workers @ 1920x1080): 带宽在 31-59 Mbps 之间波动
+    # (render_service 占用 85% CPU, 产出速率不稳), 所以阈值要留足余量,
+    # 否则会误判成"带宽不足"而降级, 反而丢画质.
+    AUTO_RES_MIN_MBPS_BY_LEVEL = {
+        (1920, 1080): 25.0,
+        (1280, 720): 14.0,
+        (960, 540): 7.0,
+        (640, 360): 3.0,
+    }
+    AUTO_RES_MIN_MBPS = 12.0   # 阶梯里没有匹配项时的兜底值
+    # 连续多少个采样窗口低于阈值才降级 (避免抖动误判)
+    AUTO_RES_SLOW_WINDOWS = 3
+    # 连续多少个窗口带宽富余才升档 (比降级更保守, 避免来回横跳)
+    AUTO_RES_FAST_WINDOWS = 6
     
     def __init__(
         self,
@@ -72,6 +99,8 @@ class MjpegStreamClient:
         # 实测流模式 ~9.6fps vs 单帧轮询 ~3fps.
         # OHCRCPY_MJPEG_STREAM=0 可禁用.
         self.use_stream: bool = os.environ.get("OHCRCPY_MJPEG_STREAM", "1") != "0"
+        # 自适应分辨率开关 (OHCRCPY_MJPEG_AUTO_RES=0 关闭, 固定分辨率)
+        self.auto_res_enabled: bool = os.environ.get("OHCRCPY_MJPEG_AUTO_RES", "1") != "0"
         # 断线回调 (设备重启/hdc 断开/心跳超时 时通知上层).
         # 不设则上层 (GUI) 无法感知断线 -> 画面卡死但状态仍显示"已连接".
         self.on_disconnected = None
@@ -85,6 +114,12 @@ class MjpegStreamClient:
         self.frame_count: int = 0
         self.decode_failure: int = 0
         self.total_bytes: int = 0
+        # 自适应分辨率状态
+        self._auto_res_index: int = 0       # 当前在阶梯上的位置
+        self._auto_res_slow_count: int = 0   # 连续低速窗口计数
+        self._auto_res_fast_count: int = 0   # 连续高速窗口计数 (升档用)
+        self._auto_res_last_check: float = 0.0
+        self._auto_res_bytes_mark: int = 0
         self.last_data_time: float = 0
         self.last_frame_time: float = 0
         self.bad_packet_bytes: int = 0
@@ -164,9 +199,21 @@ class MjpegStreamClient:
                     _j = _ri.json()
                     self.config.device_width = int(_j.get("width", 0) or 0)
                     self.config.device_height = int(_j.get("height", 0) or 0)
+                    cap_w = int(_j.get("captureWidth", 0) or 0)
+                    cap_h = int(_j.get("captureHeight", 0) or 0)
                     print_log(LogLevel.INFO, self.log_title,
                         f"设备物理分辨率 {self.config.device_width}x{self.config.device_height} "
-                        f"(抓帧 {self.config.width}x{self.config.height})")
+                        f"(抓帧 {cap_w or self.config.width}x{cap_h or self.config.height})")
+                    # 自适应阶梯起点对齐到设备实际抓帧分辨率
+                    if cap_w > 0 and cap_h > 0:
+                        for i, (lw, lh) in enumerate(self.AUTO_RES_LADDER):
+                            if lw == cap_w and lh == cap_h:
+                                self._auto_res_index = i
+                                break
+                        else:
+                            # 不在阶梯上 (设备用了个特殊分辨率) -> 插到最接近的位置
+                            self._auto_res_index = 0
+                            self.AUTO_RES_LADDER.insert(0, (cap_w, cap_h))
             except Exception as e:
                 print_log(LogLevel.WARN, self.log_title, f"获取设备分辨率失败(忽略): {e}")
             self.is_connected = True
@@ -241,6 +288,13 @@ class MjpegStreamClient:
             print_log(LogLevel.INFO, self.log_title,
                 "MJPEG 流模式已连接 (multipart, 持续推帧)")
             buf = bytearray()
+            # socket 读超时: 半开连接 (对端失联但 TCP 未断) 时靠它兜底,
+            # 否则 read1 会一直阻塞, 永远等不到异常.
+            try:
+                resp.fp.raw._sock.settimeout(15)
+            except Exception:
+                pass
+            last_rx = time.time()
             while not self._stop_event.is_set() and self.is_connected:
                 try:
                     # 必须用 read1 而不是 read: read(n) 会阻塞直到读满 n 字节,
@@ -253,13 +307,28 @@ class MjpegStreamClient:
                 except Exception as e:
                     if self._stop_event.is_set() or not self.is_connected:
                         break
-                    print_log(LogLevel.WARN, self.log_title, f"流读取失败: {type(e).__name__}: {e}")
+                    # 通信错误 (设备重启/网络断开/hdc 掉线) — 立即判定断开并通知上层.
+                    # 旧实现直接 break, 既不置 last_data_time=0 也不通知,
+                    # 结果要等满 HEARTBEAT_TIMEOUT (默认 60s) 才发现断线.
+                    print_log(LogLevel.ERROR, self.log_title,
+                        f"流读取失败: {type(e).__name__}: {e}")
+                    self._fail_count = getattr(self, "_fail_count", 0) + 1
+                    self.last_data_time = 0.0   # 心跳归零 -> 监控线程立即判定断开
+                    self._notify_disconnected(f"通信错误: {type(e).__name__}: {e}")
                     break
                 if not chunk:
+                    # 服务端关闭连接 (设备端 jpeg_server 被杀/重启)
+                    if not self._stop_event.is_set() and self.is_connected:
+                        print_log(LogLevel.ERROR, self.log_title,
+                            "视频流连接被服务端关闭 (设备端服务可能已停止)")
+                        self.last_data_time = 0.0
+                        self._notify_disconnected("视频流连接被服务端关闭")
                     break
+
                 buf.extend(chunk)
                 self.total_bytes += len(chunk)
                 self.last_data_time = time.time()
+                last_rx = time.time()
                 self._fail_count = 0
 
                 # 从缓冲区切出完整帧.
@@ -346,6 +415,8 @@ class MjpegStreamClient:
 
         self.frame_count += 1
         self.last_frame_time = time.time()
+        # 自适应分辨率: 定期根据接收速率决定是否降级
+        self._check_auto_resolution()
 
         # MJPEG 路径: 跳过 frame_queue (旧 HEVC 路径才用),
         # 直接调 on_frame_decoded 回调. frame_queue 在 MJPEG 模式下没人消费,
@@ -584,6 +655,82 @@ class MjpegStreamClient:
             return self.frame_queue.get(timeout=timeout)
         except queue.Empty:
             return None
+
+    def _check_auto_resolution(self) -> None:
+        """按实测接收速率自动调整抓帧分辨率.
+
+        带宽不足 (接收速率低于 AUTO_RES_MIN_MBPS) 且连续多个窗口都这样,
+        就降一级分辨率. 设备端 jpeg_server 支持 GET /screen.res?w=&h= 运行时调整,
+        不需要重启服务.
+        """
+        if not self.AUTO_RES_ENABLED or not self.auto_res_enabled:
+            return
+        now = time.time()
+        if now - self._auto_res_last_check < 3.0:
+            return
+        self._auto_res_last_check = now
+
+        # 3 秒窗口内的接收速率
+        bytes_in_window = self.total_bytes - self._auto_res_bytes_mark
+        self._auto_res_bytes_mark = self.total_bytes
+        mbps = bytes_in_window * 8 / 3.0 / 1_000_000.0
+
+        cur = self.AUTO_RES_LADDER[self._auto_res_index]
+        threshold = self.AUTO_RES_MIN_MBPS_BY_LEVEL.get(cur, self.AUTO_RES_MIN_MBPS)
+        if mbps < threshold:
+            self._auto_res_slow_count += 1
+            self._auto_res_fast_count = 0
+        else:
+            self._auto_res_slow_count = 0
+            # 带宽明显富余 (超过下一档阈值的 1.5 倍) 且已降过档 -> 尝试升回去.
+            # 连续多个窗口都满足才升, 避免在临界点反复横跳.
+            if self._auto_res_index > 0:
+                nxt = self.AUTO_RES_LADDER[self._auto_res_index - 1]
+                up_threshold = self.AUTO_RES_MIN_MBPS_BY_LEVEL.get(nxt, self.AUTO_RES_MIN_MBPS)
+                if mbps > up_threshold * 1.5:
+                    self._auto_res_fast_count += 1
+                else:
+                    self._auto_res_fast_count = 0
+            else:
+                self._auto_res_fast_count = 0
+
+        if self._auto_res_slow_count >= self.AUTO_RES_SLOW_WINDOWS:
+            self._auto_res_slow_count = 0
+            if self._auto_res_index + 1 < len(self.AUTO_RES_LADDER):
+                self._auto_res_index += 1
+                w, h = self.AUTO_RES_LADDER[self._auto_res_index]
+                print_log(LogLevel.WARN, self.log_title,
+                    f"带宽不足 ({mbps:.0f} Mbps < {threshold:.0f}), "
+                    f"自动降级分辨率到 {w}x{h}")
+                self._request_resolution(w, h)
+            else:
+                print_log(LogLevel.WARN, self.log_title,
+                    f"带宽不足 ({mbps:.0f} Mbps < {threshold:.0f}) "
+                    f"且已到最低分辨率 {self.AUTO_RES_LADDER[-1]}")
+        elif self._auto_res_fast_count >= self.AUTO_RES_FAST_WINDOWS:
+            self._auto_res_fast_count = 0
+            self._auto_res_index -= 1
+            w, h = self.AUTO_RES_LADDER[self._auto_res_index]
+            print_log(LogLevel.INFO, self.log_title,
+                f"带宽恢复 ({mbps:.0f} Mbps), 自动升回分辨率 {w}x{h}")
+            self._request_resolution(w, h)
+
+    def _request_resolution(self, width: int, height: int) -> bool:
+        """请求设备端调整抓帧分辨率 (GET /screen.res?w=&h=)."""
+        from urllib.parse import urlparse as _up
+        u = _up(self.url)
+        url = f"{u.scheme}://{u.netloc}/screen.res?w={int(width)}&h={int(height)}"
+        try:
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200:
+                print_log(LogLevel.INFO, self.log_title,
+                    f"设备端分辨率已调整为 {width}x{height}")
+                return True
+            print_log(LogLevel.WARN, self.log_title,
+                f"设备端分辨率调整失败: HTTP {r.status_code}")
+        except Exception as e:
+            print_log(LogLevel.WARN, self.log_title, f"设备端分辨率调整异常: {e!r}")
+        return False
 
     def set_target_size(self, width: int, height: int) -> None:
         """由 video_display 调用: 设置目标显示尺寸.

@@ -39,6 +39,14 @@ static double g_interval = 0.15;
  *   所以用 N 个 worker 各自持续抓帧, 各写各的文件, 客户端取"最新"的那张.
  *   帧率 = N / 174ms. */
 static int32_t g_workers = 4;
+/* 自动分辨率: -w 0 -h 0 时按设备物理分辨率抓帧 */
+static bool g_auto_res = false;
+
+/* 运行时分辨率调整 (/screen.res?w=&h=).
+   worker 每轮循环读取 g_capture_width/height, 改分辨率不需要重启进程. */
+static std::atomic<int32_t> g_capture_width{0};
+static std::atomic<int32_t> g_capture_height{0};
+static std::atomic<bool> g_res_changed{false};
 static std::string g_jpeg_path = "/data/local/tmp/ohscrcpy_screen.jpeg";
 static std::atomic<bool> g_running{true};
 
@@ -115,6 +123,16 @@ static void detect_device_resolution() {
         g_device_width = g_width;
         g_device_height = g_height;
     }
+
+    /* 自动模式 (-w 0 -h 0): 用设备物理分辨率作为抓帧分辨率.
+       依据: 实测 snapshot_display 单次耗时与分辨率几乎无关
+       (1920x1080 343ms / 960x540 314ms / 640x360 352ms),
+       瓶颈是进程启动而非像素量, 所以直接上最高画质不损失帧率. */
+    if (g_auto_res) {
+        g_width = g_device_width;
+        g_height = g_device_height;
+        fprintf(stderr, "[jpeg_srv] 自动分辨率 -> %dx%d\n", g_width, g_height);
+    }
 }
 
 /* 抓帧 worker: 每个 worker 抓到帧后写入共享的最新帧.
@@ -134,10 +152,13 @@ static void* capture_thread(void* arg) {
         }
     }
     char wbuf[16], hbuf[16];
-    snprintf(wbuf, sizeof(wbuf), "%d", g_width);
-    snprintf(hbuf, sizeof(hbuf), "%d", g_height);
 
     while (g_running.load()) {
+        /* 分辨率可在运行时调整 (客户端按网络能力自动降级) */
+        int32_t cw = g_capture_width.load();
+        int32_t ch = g_capture_height.load();
+        snprintf(wbuf, sizeof(wbuf), "%d", cw);
+        snprintf(hbuf, sizeof(hbuf), "%d", ch);
         /* fork + exec snapshot_display (设备 shell 可能不支持 system()) */
         pid_t pid = fork();
         if (pid == 0) {
@@ -155,18 +176,32 @@ static void* capture_thread(void* arg) {
             int status = 0;
             waitpid(pid, &status, 0);
         }
-        /* 读取文件内容 */
+        /* 读取文件内容.
+           注意: snapshot_display 写文件时主进程可能正在读, 会拿到半截 JPEG
+           (实测出现过 4096 字节的残帧). 这里校验 JPEG 头尾 (SOI/EOI),
+           不完整就丢弃, 等下一次抓帧. */
         int fd = open(path.c_str(), O_RDONLY);
         if (fd >= 0) {
             struct stat st{};
-            if (fstat(fd, &st) == 0 && st.st_size > 0) {
+            if (fstat(fd, &st) == 0 && st.st_size > 1024) {
                 std::vector<uint8_t> buf((size_t)st.st_size);
                 ssize_t n = read(fd, buf.data(), buf.size());
                 if (n > 0) {
                     buf.resize((size_t)n);
-                    std::lock_guard<std::mutex> lk(g_frame_mutex);
-                    g_frame.swap(buf);
-                    g_seq.fetch_add(1);
+                    /* JPEG 完整性: 头 FFD8FF, 尾 FFD9 */
+                    bool ok = n > 4 &&
+                              buf[0] == 0xFF && buf[1] == 0xD8 && buf[2] == 0xFF &&
+                              buf[(size_t)n - 2] == 0xFF && buf[(size_t)n - 1] == 0xD9;
+                    if (ok) {
+                        std::lock_guard<std::mutex> lk(g_frame_mutex);
+                        g_frame.swap(buf);
+                        g_seq.fetch_add(1);
+                    } else {
+                        static int bad_cnt = 0;
+                        if ((++bad_cnt % 50) == 1) {
+                            fprintf(stderr, "[jpeg_srv] 丢弃不完整帧 (%zu 字节)\n", (size_t)n);
+                        }
+                    }
                 }
             }
             close(fd);
@@ -238,6 +273,14 @@ static void serve_mjpeg(int cfd) {
     close(cfd);
 }
 
+static void serve_once(int cfd);
+
+static void* client_thread(void* arg) {
+    int cfd = (int)(intptr_t)arg;
+    serve_once(cfd);
+    return nullptr;
+}
+
 static void serve_once(int cfd) {
     char req[1024];
     size_t used = 0;
@@ -254,6 +297,36 @@ static void serve_once(int cfd) {
         const char* h = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=OHScrcpyFrame\r\nConnection: close\r\n\r\n";
         send_all(cfd, h, strlen(h));
         serve_mjpeg(cfd);
+        return;
+    }
+
+    /* 运行时调整抓帧分辨率: GET /screen.res?w=1280&h=720
+       客户端按实测网络吞吐自动降级时调用, 不需要重启 jpeg_server. */
+    if (strstr(req, "GET /screen.res")) {
+        int nw = g_capture_width.load();
+        int nh = g_capture_height.load();
+        const char* q = strstr(req, "w=");
+        if (q) nw = atoi(q + 2);
+        q = strstr(req, "h=");
+        if (q) nh = atoi(q + 2);
+        if (nw > 0 && nh > 0 && (nw != g_capture_width.load() || nh != g_capture_height.load())) {
+            g_capture_width.store(nw);
+            g_capture_height.store(nh);
+            g_res_changed.store(true);
+            fprintf(stderr, "[jpeg_srv] 分辨率调整为 %dx%d\n", nw, nh);
+        }
+        char body[128];
+        int n = snprintf(body, sizeof(body),
+            "{\"width\":%d,\"height\":%d,\"captureWidth\":%d,\"captureHeight\":%d}",
+            g_device_width, g_device_height,
+            g_capture_width.load(), g_capture_height.load());
+        char h[160];
+        int hn = snprintf(h, sizeof(h),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+            n);
+        send_all(cfd, h, (size_t)hn);
+        send_all(cfd, body, (size_t)n);
+        close(cfd);
         return;
     }
 
@@ -314,6 +387,12 @@ int main(int argc, char** argv) {
     }
     if (g_workers < 1) g_workers = 1;
     if (g_workers > 16) g_workers = 16;
+    /* 宽高为 0 -> 自动模式 (用设备物理分辨率) */
+    if (g_width <= 0 || g_height <= 0) {
+        g_auto_res = true;
+        g_width = 1920;   /* 探测失败时的兜底值, 探测成功会被覆盖 */
+        g_height = 1080;
+    }
     fprintf(stderr, "[jpeg_srv] cfg %dx%d interval=%.2fs workers=%d file=%s\n",
             g_width, g_height, g_interval, g_workers, g_jpeg_path.c_str());
     detect_device_resolution();
@@ -324,6 +403,10 @@ int main(int argc, char** argv) {
 
     int fd = setup_listener(g_port);
     if (fd < 0) return 1;
+
+    /* 初始化运行时分辨率 (worker 从这里读) */
+    g_capture_width.store(g_width);
+    g_capture_height.store(g_height);
 
     /* 启动 N 个抓帧 worker.
        实测并发可把吞吐从 5.5fps 提到 ~16fps (8 核设备). */
@@ -345,7 +428,12 @@ int main(int argc, char** argv) {
         socklen_t len = sizeof(cli);
         int cfd = accept(fd, (struct sockaddr*)&cli, &len);
         if (cfd < 0) { if (errno == EINTR) continue; break; }
-        serve_once(cfd);
+        /* 每连接一个线程: MJPEG 流是长连接, 独占主线程会导致
+           /screen.info /screen.res 等其它请求全部排队 (实测连接超时).
+           客户端断线后主线程也就能立即 accept 下一个连接. */
+        pthread_t th;
+        pthread_create(&th, nullptr, client_thread, (void*)(intptr_t)cfd);
+        pthread_detach(th);
     }
     close(fd);
     fprintf(stderr, "[jpeg_srv] stopped\n");

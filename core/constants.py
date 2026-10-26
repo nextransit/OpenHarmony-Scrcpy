@@ -29,7 +29,11 @@ DEFAULT_PORT = 27183
 HOST = "127.0.0.1"
 
 # ==================== 心跳配置 ====================
-HEARTBEAT_TIMEOUT = float(__import__('os').environ.get('OHCRCPY_HEARTBEAT_TIMEOUT', '60'))  # MJPEG 模式: 设备端 httpd 慢, 容错窗口放大  # 心跳超时时间（秒）
+# 心跳超时 (秒): 超过这个时间没收到任何视频数据就判定断线.
+# 默认 15s — 之前是 60s, 网络断开时用户要等整整一分钟才看到提示.
+# 流模式下设备端是持续推帧, 正常时每帧间隔 <200ms, 15s 足够宽松;
+# 环境变量可按网络状况调整 (弱网可调大).
+HEARTBEAT_TIMEOUT = float(__import__('os').environ.get('OHCRCPY_HEARTBEAT_TIMEOUT', '15'))
 HEARTBEAT_INTERVAL = 2.0  # 心跳发送间隔（秒）
 
 # ==================== 数据包配置 ====================

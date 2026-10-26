@@ -30,9 +30,16 @@ export OHCRCPY_H264_BITRATE=${OHCRCPY_H264_BITRATE:-8000000}
 # 960x540 + 0.05s 间隔: 实测 20fps (设备端 snapshot_display 约 13fps 上限,
 # 加上 HTTP 传输与客户端解码后稳定在 18-20fps).
 # 1280x720 + 0.1s 间隔只有 4-5fps, 因为间隔太长白白浪费了抓帧时间.
-export OHCRCPY_MJPEG_WIDTH=${OHCRCPY_MJPEG_WIDTH:-960}
-export OHCRCPY_MJPEG_HEIGHT=${OHCRCPY_MJPEG_HEIGHT:-540}
+# 抓帧分辨率: 0 = 自动 (设备端探测物理分辨率, 最高画质).
+# 实测 snapshot_display 耗时与分辨率几乎无关 (瓶颈是进程启动), 提分辨率几乎不损失帧率;
+# 带宽不足时客户端会按实测速率自动降级 (video/mjpeg_client.py AUTO_RES_LADDER).
+export OHCRCPY_MJPEG_WIDTH=${OHCRCPY_MJPEG_WIDTH:-0}
+export OHCRCPY_MJPEG_HEIGHT=${OHCRCPY_MJPEG_HEIGHT:-0}
 export OHCRCPY_MJPEG_INTERVAL=${OHCRCPY_MJPEG_INTERVAL:-0.05}
+# 抓帧并发数 (8 核设备实测: 6 路 ~9.6fps, 8 路 ~11.2fps)
+export OHCRCPY_MJPEG_WORKERS=${OHCRCPY_MJPEG_WORKERS:-6}
+# 自适应分辨率开关 (0 = 关闭, 固定用上面的分辨率)
+export OHCRCPY_MJPEG_AUTO_RES=${OHCRCPY_MJPEG_AUTO_RES:-1}
 
 
 # 自动推送服务端到已连接设备 (按设备架构自动选二进制)
