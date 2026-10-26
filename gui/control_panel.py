@@ -49,8 +49,9 @@ class ControlPanel:
         ("rotate",      ICONS["rotate"],      "旋转屏幕",     "secondary", "rotate"),
         ("screen_off",  ICONS["screen_off"],  "熄屏运行",     "secondary", "screen_off"),
         "__sep__",
-        # 分组 4: 键盘映射
+        # 分组 4: 显示控制
         ("keyboard",    ICONS["keyboard"],    "键盘映射 F12",  "secondary", "toggle_keyboard"),
+        ("resolution",  ICONS["resolution"],  "切换分辨率",    "secondary", "resolution"),
     ]
 
     def __init__(self, parent: tk.Widget, callbacks: Dict[str, Callable[[], None]]) -> None:

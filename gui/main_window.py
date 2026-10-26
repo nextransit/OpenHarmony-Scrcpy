@@ -570,6 +570,7 @@ class MainWindow:
             'rotate': self._rotate_screen,
             'screen_off': self._screen_off,
             'toggle_keyboard': self._toggle_keyboard_mapper,
+            'resolution': self._show_resolution_dialog,
         }
         self.control_panel = ControlPanel(right_container, callbacks)
         self.control_panel.set_buttons_enabled(False)
@@ -771,6 +772,206 @@ class MainWindow:
             return
         self.keyboard_mapper.handle_key_release(event)
     
+    def _resolution_ladder(self) -> List[tuple]:
+        """可切换的分辨率档位.
+
+        MJPEG 模式: 客户端自带的自动降级阶梯.
+        H.264 模式: 常用档位 (loongarch 设备无 AVC 编码器, 实际走 MJPEG).
+        """
+        vc = self.connection_manager.get_video_client() if self.connection_manager else None
+        ladder = getattr(vc, "AUTO_RES_LADDER", None) if vc else None
+        if ladder:
+            # 去重 + 保证当前档位在列表里
+            out = []
+            cur = None
+            try:
+                cur = tuple(vc.get_capture_resolution()) if hasattr(vc, "get_capture_resolution") else None
+            except Exception:
+                cur = None
+            for wh in ladder:
+                if tuple(int(x) for x in wh) not in out:
+                    out.append(tuple(int(x) for x in wh))
+            if cur and not any(w == cur[0] and h == cur[1] for w, h in out):
+                out.insert(0, cur)
+            return out
+        return [(1920, 1080), (1280, 720), (960, 540), (640, 360)]
+
+    def _current_capture_resolution(self) -> Optional[Tuple[int, int]]:
+        """当前抓帧分辨率."""
+        vc = self.connection_manager.get_video_client() if self.connection_manager else None
+        if vc is None:
+            return None
+        try:
+            cfg = getattr(vc, "config", None)
+            w = int(getattr(cfg, "width", 0) or 0)
+            h = int(getattr(cfg, "height", 0) or 0)
+            if w > 0 and h > 0:
+                return (w, h)
+        except Exception:
+            pass
+        return None
+
+    def _show_resolution_dialog(self) -> None:
+        """弹出分辨率选择对话框."""
+        if not self.is_connected or self.connection_manager is None:
+            self._update_device_status("连接后才可以切换分辨率")
+            return
+        vc = self.connection_manager.get_video_client()
+        if vc is None:
+            self._update_device_status("视频客户端未就绪")
+            return
+
+        cur = self._current_capture_resolution()
+        ladder = self._resolution_ladder()
+
+        try:
+            import ttkbootstrap as ttk_b
+            win = ttk_b.Toplevel(self.root)
+        except ImportError:
+            win = tk.Toplevel(self.root)
+        win.title("切换分辨率")
+        win.geometry("360x420")
+        win.attributes("-topmost", True)
+        win.transient(self.root)
+
+        tb_label(
+            win, text="抓帧分辨率",
+            font=Theme.FONT_TITLE, bootstyle="inverse-info",
+            anchor="w",
+        ).pack(pady=(14, 4), anchor="w", padx=20, fill=tk.X)
+
+        cur_text = f"{cur[0]}x{cur[1]}" if cur else "未知"
+        try:
+            phys = f"{self.video_display._device_aspect[0]}x{self.video_display._device_aspect[1]}" if self.video_display else "-"
+        except Exception:
+            phys = "-"
+        tb_label(
+            win, text=f"当前: {cur_text}   ·   物理: {phys}",
+            font=Theme.FONT_SMALL, bootstyle="secondary",
+            anchor="w",
+        ).pack(pady=(0, 10), anchor="w", padx=20, fill=tk.X)
+
+        from tkinter import ttk as tk_ttk
+        body = tk_ttk.Frame(win, padding=10)
+        body.pack(fill=tk.BOTH, expand=True, padx=20, pady=(0, 8))
+
+        for i, (w, h) in enumerate(ladder):
+            active = cur and cur[0] == w and cur[1] == h
+            row = tk_ttk.Frame(body)
+            row.pack(fill=tk.X, pady=3)
+            tb_label(
+                row, text=f"{w}x{h}",
+                font=("Consolas", 11, "bold" if active else "normal"),
+                bootstyle=("info" if active else ""),
+                anchor="w", width=14,
+            ).pack(side=tk.LEFT, padx=(4, 8))
+            state_text = "当前" if active else ("高画质" if i == 0 else ("流畅优先" if i == len(ladder) - 1 else ""))
+            tb_label(
+                row, text=state_text, font=Theme.FONT_SMALL,
+                bootstyle=("success" if active else "secondary"),
+                anchor="w",
+            ).pack(side=tk.LEFT)
+            tb_button(
+                row, text="选择", command=lambda wh=(w, h): self._apply_resolution(win, wh[0], wh[1]),
+                bootstyle=("info" if not active else "secondary"),
+                width=6,
+            ).pack(side=tk.RIGHT)
+
+        tb_label(
+            win, text="切换后自动关闭带宽自适应, 避免被改回去。",
+            font=Theme.FONT_SMALL, bootstyle="secondary", anchor="w",
+        ).pack(pady=(0, 10), anchor="w", padx=24, fill=tk.X)
+
+        tb_button(
+            win, text="关闭", command=win.destroy,
+            bootstyle="secondary", width=10,
+        ).pack(pady=(0, 14))
+
+    def _apply_resolution(self, dialog, width: int, height: int) -> None:
+        """应用选中的分辨率 (MJPEG 热切换; H.264 需重启 streamer)."""
+        try:
+            dialog.destroy()
+        except Exception:
+            pass
+        vc = self.connection_manager.get_video_client() if self.connection_manager else None
+        codec = vc.__class__.__name__ if vc else ""
+        print_log(LogLevel.INFO, self.log_title, f"切换分辨率: {width}x{height} (client={codec})")
+
+        # MJPEG: 设备端 jpeg_server 支持运行时热切换, 无需断流.
+        if hasattr(vc, "set_capture_resolution"):
+            self._update_device_status(f"切换分辨率到 {width}x{height}…")
+            ok = False
+            try:
+                ok = vc.set_capture_resolution(width, height)
+            except Exception as e:
+                print_log(LogLevel.WARN, self.log_title, f"切换分辨率异常: {e!r}")
+            if ok:
+                self._update_device_status(f"分辨率已切换: {width}x{height}")
+                self._sync_resolution_after_switch(width, height)
+            else:
+                self._update_device_status("分辨率切换失败")
+            return
+
+        # H.264: 需重启 streamer 并重连 (会短暂断流).
+        self._switch_resolution_h264(width, height)
+
+    def _sync_resolution_after_switch(self, width: int, height: int) -> None:
+        """分辨率切换后, 同步显示尺寸与点击坐标基准 (无需重连)."""
+        try:
+            vc = self.connection_manager.get_video_client() if self.connection_manager else None
+            # 1) 让 video_display 按新尺寸重算显示布局 (下一帧到达时也会自然更新,
+            #    这里主动 push 一次 config 避免首帧前黑屏比例错误).
+            if vc is not None:
+                vc.set_target_size(0, 0)  # 清除旧目标尺寸, 让 video_display 重算
+            # 2) 窗口跟随新视频比例自适应.
+            aspect = getattr(vc, "config", None)
+            aw, ah = 0, 0
+            if aspect is not None:
+                aw = int(getattr(aspect, "width", 0) or 0)
+                ah = int(getattr(aspect, "height", 0) or 0)
+            if aw > 0 and ah > 0:
+                # 窗口已按旧比例调整过, 强制按新比例重算
+                self._window_adjusted_for_video = None
+                self._adjust_window_to_video(aw, ah)
+        except Exception as e:
+            print_log(LogLevel.WARN, self.log_title, f"切换后同步布局失败(忽略): {e!r}")
+
+    def _switch_resolution_h264(self, width: int, height: int) -> None:
+        """H.264 模式: 重启 oh264_streamer 换分辨率并重连 (会短暂断流)."""
+        mgr = self.h264_server_manager
+        if mgr is None and self.server_deployer is not None:
+            mgr = getattr(self.server_deployer, "h264_server_manager", None)
+        if mgr is None:
+            self._update_device_status("H.264 streamer 未就绪, 无法切换")
+            return
+        self._update_device_status(f"重启 streamer: {width}x{height} (短暂断流)…")
+        try:
+            # 断开当前视频流 (避免占用抓帧/编码)
+            if self.connection_manager is not None:
+                self.connection_manager.disconnect()
+            # 重启 streamer (setup 会 kill 旧进程并带新 -w/-h 启动)
+            mgr.stop()
+            ok = mgr.setup(port=mgr.port, width=width, height=height,
+                           fps=getattr(mgr, "fps", 30),
+                           bitrate=getattr(mgr, "bitrate", 8000000),
+                           env_override=False)
+            if not ok:
+                self._update_device_status(f"streamer 重启失败 ({width}x{height})")
+                return
+            # 重连视频流
+            if self.connection_manager is not None:
+                port = getattr(self.connection_manager, "_forwarded_port", -1)
+                if port <= 0:
+                    port = int(os.environ.get('OHCRCPY_H264_PORT', str(H264_STREAM_PORT)))
+                if self.connection_manager.connect(port):
+                    self._update_device_status(f"分辨率已切换: {width}x{height}")
+                else:
+                    self._update_device_status(f"重连失败 ({width}x{height})")
+        except Exception as e:
+            print_log(LogLevel.WARN, self.log_title, f"H.264 切换分辨率异常: {e!r}")
+            self._update_device_status("切换分辨率失败")
+        return
+
     def _toggle_keyboard_mapper(self) -> None:
         """F12 切换键盘映射开关"""
         if self.keyboard_mapper is not None:
@@ -1405,13 +1606,6 @@ class MainWindow:
                 target_device = device
                 break
         
-        # 记住这个网络设备 (host:port), 下次启动/掉线后可自动 tconn 重连
-        if target_device:
-            try:
-                self.device_manager.remember_device(target_device.sn)
-            except Exception as e:
-                print_log(LogLevel.WARN, self.log_title, f"记住设备失败: {e!r}")
-
         if not target_device or not self.device_manager.select_device(target_device.sn):
             self._update_device_status("设备选择失败")
             self._set_server_deploy_state(ServerDeployState.IDLE)

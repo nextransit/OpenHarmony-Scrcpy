@@ -732,6 +732,50 @@ class MjpegStreamClient:
             print_log(LogLevel.WARN, self.log_title, f"设备端分辨率调整异常: {e!r}")
         return False
 
+    def get_capture_resolution(self) -> Tuple[int, int]:
+        """当前抓帧分辨率 (设备端实际生效的尺寸)."""
+        return (int(self.config.width), int(self.config.height))
+
+    def set_capture_resolution(self, width: int, height: int) -> bool:
+        """手动切换抓帧分辨率 (用户主动选择, 不需要断流).
+
+        设备端 jpeg_server 支持 GET /screen.res?w=&h= 运行时调整, worker 每轮
+        读取新尺寸, 无需重启服务.
+
+        注意: config.width/height 必须同步更新 —— 它是点击坐标换算的基准
+        (device_controller 用 device_width / config.width 算 input_scale),
+        不同步会导致切完分辨率后点击位置偏移.
+        """
+        width = int(width)
+        height = int(height)
+        if width <= 0 or height <= 0:
+            print_log(LogLevel.WARN, self.log_title,
+                f"无效的分辨率 {width}x{height}, 已忽略")
+            return False
+
+        cur_w, cur_h = self.get_capture_resolution()
+        if (cur_w, cur_h) == (width, height):
+            print_log(LogLevel.INFO, self.log_title,
+                f"分辨率已是 {width}x{height}, 无需切换")
+            return True
+
+        if not self._request_resolution(width, height):
+            return False
+
+        # 同步客户端侧的抓帧分辨率 (点击坐标换算基准).
+        self.config.width = width
+        self.config.height = height
+        # 手动切换后关闭自动降级: 否则下一带宽窗口又会把分辨率改回去.
+        self.auto_res_enabled = False
+        # 同步自动降级阶梯的当前位置, 避免关闭自动降级后索引停留在旧档.
+        for i, (lw, lh) in enumerate(self.AUTO_RES_LADDER):
+            if (lw, lh) == (width, height):
+                self._auto_res_index = i
+                break
+        print_log(LogLevel.INFO, self.log_title,
+            f"分辨率已切换为 {width}x{height} (自动降级已关闭)")
+        return True
+
     def set_target_size(self, width: int, height: int) -> None:
         """由 video_display 调用: 设置目标显示尺寸.
 

@@ -93,6 +93,7 @@ ICONS: Dict[str, str] = {
     "unlock": "⤓",
     "keyboard": "⌨",
     "settings": "⚙",
+    "resolution": "⬒",   # 分辨率切换
     "close": "✕",
     "expand": "⤢",
     "collapse": "⤡",
