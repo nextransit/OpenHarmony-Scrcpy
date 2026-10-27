@@ -305,8 +305,12 @@ def device_enable(hdc: Hdc) -> None:
       - chcon 还原 licenseMonitor_exec 标签
       - --disable 可用备份一键还原
     """
-    # 1) 备份原二进制 (只做一次)
-    hdc.shell(f"[ -f {REMOTE_BACKUP_BIN} ] || cp {REMOTE_BIN} {REMOTE_BACKUP_BIN} 2>/dev/null")
+    # 1) 备份原二进制 (只做一次) —— 备份失败必须中止, 否则无法回滚
+    if not device_file_exists(hdc, REMOTE_BACKUP_BIN):
+        rc, out = hdc.shell(f"cp {REMOTE_BIN} {REMOTE_BACKUP_BIN} 2>&1")
+        if rc != 0 or not device_file_exists(hdc, REMOTE_BACKUP_BIN):
+            die(f"备份原二进制失败, 已中止 (避免无法回滚): {out.strip()[:200]}")
+        log(f"已备份原二进制 -> {REMOTE_BACKUP_BIN}")
     # 2) 备份 cfg (万一之前误改过 cfg, 一并还原)
     hdc.shell(f"[ -f {REMOTE_CFG_BACKUP} ] || cp {REMOTE_CFG} {REMOTE_CFG_BACKUP} 2>/dev/null")
     # 3) 根分区只读 -> remount rw
