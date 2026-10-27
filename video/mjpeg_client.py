@@ -53,27 +53,35 @@ class MjpegStreamClient:
     POLL_INTERVAL_MS = 100       # 起步 100ms, 然后自适应调整
 
     # ---- 自适应分辨率 ----
-    # 依据实测: snapshot_display 耗时与分辨率几乎无关 (1920x1080 与 640x360 同为 ~340ms),
-    # 瓶颈是进程启动; 但传输带宽与分辨率平方成正比:
-    #     960x540  @16fps -> 48 Mbps | 1280x720 @16fps -> 85 Mbps | 1920x1080 @16fps -> 191 Mbps
-    # 所以按实测接收速率自动降级, 保证画面流畅优先于清晰度.
+    # 真机实测 (loongarch 8 核, 4 workers, 1920x1080, MJPEG multipart 端到端):
+    #
+    #   档位        帧率      实测接收带宽
+    #   1920x1080   1.20fps   8.8 Mbps
+    #   1280x720    2.20fps   8.9 Mbps
+    #   960x540     3.49fps   8.3 Mbps
+    #   640x360     6.59fps   4.7 Mbps
+    #
+    # 关键结论: **带宽在各档位几乎恒定 (8-9 Mbps)**, 帧率随分辨率线性下降.
+    # 说明瓶颈不是带宽, 而是**每帧的处理成本** (snapshot_display 抓屏 + JPEG 编码
+    # + 传输 + 解码), 降分辨率确实能提帧率, 但会牺牲清晰度.
+    #
+    # 阈值必须按**实测带宽**标定, 不能按"满帧率所需带宽"标定.
+    # 旧阈值 (1080p 需 25 Mbps) 是按 16fps 理论值算的, 而设备实际只有 1-8fps,
+    # 实测带宽 8-9 Mbps 永远达不到 25 -> **一直误判"带宽不足" -> 一直降级到
+    # 640x360 -> 画面永久模糊** (用户手动选 1080p 也会被拉回去).
+    # 现按实测重标, 留 35% 余量, 避免抖动误判.
     AUTO_RES_ENABLED = True
     # 降级阶梯 (从高到低)
     AUTO_RES_LADDER = [(1920, 1080), (1280, 720), (960, 540), (640, 360)]
     # 低于该速率 (Mbps) 判定带宽不足, 降一级.
-    # 实测 1920x1080 @ 18fps 只有 43 Mbps (帧 208KB), 所以阈值按分辨率分档:
-    #   1080p 需要 >= 45 Mbps | 720p >= 25 | 540p >= 12 | 360p >= 5
-    # 固定阈值会让 1080p 明明够用却被误判成"带宽不足"而降级.
-    # 实测 (6 workers @ 1920x1080): 带宽在 31-59 Mbps 之间波动
-    # (render_service 占用 85% CPU, 产出速率不稳), 所以阈值要留足余量,
-    # 否则会误判成"带宽不足"而降级, 反而丢画质.
+    # 依据上表实测带宽 (8.8 / 8.9 / 8.3 / 4.7 Mbps) 留余量后标定.
     AUTO_RES_MIN_MBPS_BY_LEVEL = {
-        (1920, 1080): 25.0,
-        (1280, 720): 14.0,
-        (960, 540): 7.0,
-        (640, 360): 3.0,
+        (1920, 1080): 5.0,
+        (1280, 720): 5.0,
+        (960, 540): 4.0,
+        (640, 360): 2.0,
     }
-    AUTO_RES_MIN_MBPS = 12.0   # 阶梯里没有匹配项时的兜底值
+    AUTO_RES_MIN_MBPS = 4.0   # 阶梯里没有匹配项时的兜底值
     # 连续多少个采样窗口低于阈值才降级 (避免抖动误判)
     AUTO_RES_SLOW_WINDOWS = 3
     # 连续多少个窗口带宽富余才升档 (比降级更保守, 避免来回横跳)
@@ -101,6 +109,9 @@ class MjpegStreamClient:
         self.use_stream: bool = os.environ.get("OHCRCPY_MJPEG_STREAM", "1") != "0"
         # 自适应分辨率开关 (OHCRCPY_MJPEG_AUTO_RES=0 关闭, 固定分辨率)
         self.auto_res_enabled: bool = os.environ.get("OHCRCPY_MJPEG_AUTO_RES", "1") != "0"
+        # 用户手动选过分辨率后锁定: 自动降级不再改回来.
+        # 否则用户选 1920x1080 会被自动降级立刻拉回 640x360, 表现为"选了没用/画面很糊".
+        self.resolution_locked: bool = False
         # 断线回调 (设备重启/hdc 断开/心跳超时 时通知上层).
         # 不设则上层 (GUI) 无法感知断线 -> 画面卡死但状态仍显示"已连接".
         self.on_disconnected = None
@@ -665,6 +676,9 @@ class MjpegStreamClient:
         """
         if not self.AUTO_RES_ENABLED or not self.auto_res_enabled:
             return
+        if self.resolution_locked:
+            # 用户手动指定过分辨率 -> 不再自动调整 (用户意图优先).
+            return
         now = time.time()
         if now - self._auto_res_last_check < 3.0:
             return
@@ -702,7 +716,12 @@ class MjpegStreamClient:
                 print_log(LogLevel.WARN, self.log_title,
                     f"带宽不足 ({mbps:.0f} Mbps < {threshold:.0f}), "
                     f"自动降级分辨率到 {w}x{h}")
-                self._request_resolution(w, h)
+                if self._request_resolution(w, h):
+                    # 设备端已改档, 必须同步 config —— 它是点击坐标换算的基准,
+                    # 也是 set_capture_resolution 判断"是否已是该分辨率"的依据.
+                    # 不同步会导致: 手动切回高分辨率时被误判为"已是"而什么都不做.
+                    self.config.width = w
+                    self.config.height = h
             else:
                 print_log(LogLevel.WARN, self.log_title,
                     f"带宽不足 ({mbps:.0f} Mbps < {threshold:.0f}) "
@@ -713,16 +732,28 @@ class MjpegStreamClient:
             w, h = self.AUTO_RES_LADDER[self._auto_res_index]
             print_log(LogLevel.INFO, self.log_title,
                 f"带宽恢复 ({mbps:.0f} Mbps), 自动升回分辨率 {w}x{h}")
-            self._request_resolution(w, h)
+            if self._request_resolution(w, h):
+                self.config.width = w
+                self.config.height = h
 
     def _request_resolution(self, width: int, height: int) -> bool:
-        """请求设备端调整抓帧分辨率 (GET /screen.res?w=&h=)."""
+        """请求设备端调整抓帧分辨率 (GET /screen.res?w=&h=).
+
+        注意: 必须以 /screen.res 的**返回值**为准, 不能用 /screen.info ——
+        设备端 jpeg_server 的 /screen.info 返回的是**启动参数** g_width/g_height,
+        不是运行时的 g_capture_width/g_capture_height (设备端源码 bug).
+        实测: 设备端已降到 640x360 时, /screen.info 仍报 1920x1080,
+              而 /screen.res 正确返回 captureWidth=640.
+        """
         from urllib.parse import urlparse as _up
         u = _up(self.url)
         url = f"{u.scheme}://{u.netloc}/screen.res?w={int(width)}&h={int(height)}"
         try:
             r = requests.get(url, timeout=8)
             if r.status_code == 200:
+                actual = self._parse_capture_size(r)
+                if actual:
+                    width, height = actual
                 print_log(LogLevel.INFO, self.log_title,
                     f"设备端分辨率已调整为 {width}x{height}")
                 return True
@@ -731,6 +762,39 @@ class MjpegStreamClient:
         except Exception as e:
             print_log(LogLevel.WARN, self.log_title, f"设备端分辨率调整异常: {e!r}")
         return False
+
+    @staticmethod
+    def _parse_capture_size(response) -> Optional[Tuple[int, int]]:
+        """从 /screen.res 响应里解析设备端实际抓帧尺寸."""
+        try:
+            j = response.json()
+            cw = int(j.get("captureWidth", 0) or 0)
+            ch = int(j.get("captureHeight", 0) or 0)
+            if cw > 0 and ch > 0:
+                return (cw, ch)
+        except Exception:
+            pass
+        return None
+
+    def query_capture_resolution(self) -> Optional[Tuple[int, int]]:
+        """查询设备端**当前实际**抓帧分辨率.
+
+        用 /screen.res (不带参数) 而非 /screen.info —— 后者返回的是启动参数,
+        不反映运行时实际值 (设备端 jpeg_server 的已知 bug).
+        """
+        from urllib.parse import urlparse as _up
+        u = _up(self.url)
+        url = f"{u.scheme}://{u.netloc}/screen.res"
+        try:
+            r = requests.get(url, timeout=8)
+            if r.status_code == 200:
+                size = self._parse_capture_size(r)
+                if size:
+                    return size
+        except Exception as e:
+            print_log(LogLevel.WARN, self.log_title,
+                f"查询设备端实际分辨率失败: {e!r}")
+        return None
 
     def get_capture_resolution(self) -> Tuple[int, int]:
         """当前抓帧分辨率 (设备端实际生效的尺寸)."""
@@ -753,20 +817,29 @@ class MjpegStreamClient:
                 f"无效的分辨率 {width}x{height}, 已忽略")
             return False
 
-        cur_w, cur_h = self.get_capture_resolution()
-        if (cur_w, cur_h) == (width, height):
+        # 以**设备端实际值**判断, 不能用本地 config ——
+        # 自动降级只改设备端, 本地 config 可能过期, 导致误判"已是该分辨率"
+        # 而什么都不做 (实测: 设备端已降到 640x360, 用户选 1920x1080 却提示"无需切换").
+        actual = self.query_capture_resolution()
+        if actual == (width, height):
             print_log(LogLevel.INFO, self.log_title,
-                f"分辨率已是 {width}x{height}, 无需切换")
+                f"设备端分辨率已是 {width}x{height}, 无需切换")
+            self.config.width = width
+            self.config.height = height
             return True
 
         if not self._request_resolution(width, height):
             return False
 
         # 同步客户端侧的抓帧分辨率 (点击坐标换算基准).
-        self.config.width = width
-        self.config.height = height
-        # 手动切换后关闭自动降级: 否则下一带宽窗口又会把分辨率改回去.
+        final = self.query_capture_resolution() or (width, height)
+        self.config.width = final[0]
+        self.config.height = final[1]
+        # 手动切换后锁定分辨率: 否则下一带宽窗口又会把分辨率改回去,
+        # 用户选了 1920x1080 却被拉回 640x360 (表现为"选了没用, 画面很糊").
+        self.resolution_locked = True
         self.auto_res_enabled = False
+        width, height = self.config.width, self.config.height
         # 同步自动降级阶梯的当前位置, 避免关闭自动降级后索引停留在旧档.
         for i, (lw, lh) in enumerate(self.AUTO_RES_LADDER):
             if (lw, lh) == (width, height):

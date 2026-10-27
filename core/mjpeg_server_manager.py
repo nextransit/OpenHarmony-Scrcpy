@@ -31,11 +31,17 @@ class MjpegServerManager:
     DEFAULT_WIDTH = 0      # 0 = 自动 (用设备物理分辨率)
     DEFAULT_HEIGHT = 0
     DEFAULT_INTERVAL_S = 0.05
-    # 抓帧并发数: 实测 loongarch 8 核设备上, 单路 snapshot_display ~174ms
-    # (进程启动为主, 与分辨率几乎无关), 串行上限 ~1.8fps (MJPEG 流实测).
-    # 并发实测: 1 路 1.8fps | 4 路 6.2fps | 6 路 9.6fps | 8 路 11.2fps.
-    # 取 6: 兼顾帧率与给设备端解码/合成留 CPU.
-    DEFAULT_WORKERS = 6
+    # 抓帧并发数.
+    # 真机实测 (loongarch 8 核, 1920x1080, MJPEG multipart 端到端, 12s/档):
+    #   1 路 4.32fps (load 1.46) | 2 路 4.90fps (2.20) | 3 路 4.58fps (2.82)
+    #   4 路 5.41fps (3.47) | 6 路 5.42fps (4.44)
+    # 结论: 4 路是拐点 —— 再加 worker 帧率不再提升 (5.41 -> 5.42), 但 CPU 负载
+    # 反而增加 28% (3.47 -> 4.44). 高负载本身会拖慢抓屏 (满载时实测只有 2.24fps),
+    # 所以取 4 而不是 6.
+    # 另注: 单路 snapshot_display 约 300-370ms, 瓶颈是进程启动 + 显示管线,
+    # 与分辨率几乎无关 (1080p 343ms / 720p 300ms / 540p 314ms / 360p 352ms),
+    # 因此降分辨率并不能提高帧率.
+    DEFAULT_WORKERS = 4
     LOOP_PID_FILE = "/data/local/tmp/ohscrcpy_mjpeg_loop.pid"
     
     def __init__(self, hdc_executor: HDCCommandExecutor) -> None:

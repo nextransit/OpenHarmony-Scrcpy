@@ -877,15 +877,26 @@ class MainWindow:
                 width=6,
             ).pack(side=tk.RIGHT)
 
+        locked = bool(getattr(vc, "resolution_locked", False))
         tb_label(
-            win, text="切换后自动关闭带宽自适应, 避免被改回去。",
+            win, text=("当前已锁定分辨率, 自动降级不会改动它。"
+                       if locked else
+                       "切换后自动关闭带宽自适应, 避免被改回去。"),
             font=Theme.FONT_SMALL, bootstyle="secondary", anchor="w",
         ).pack(pady=(0, 10), anchor="w", padx=24, fill=tk.X)
 
+        btn_row = tk_ttk.Frame(win)
+        btn_row.pack(pady=(0, 14))
+        if locked:
+            tb_button(
+                btn_row, text="恢复自动", width=10,
+                command=lambda: self._resume_auto_resolution(win),
+                bootstyle="warning",
+            ).pack(side=tk.LEFT, padx=4)
         tb_button(
-            win, text="关闭", command=win.destroy,
+            btn_row, text="关闭", command=win.destroy,
             bootstyle="secondary", width=10,
-        ).pack(pady=(0, 14))
+        ).pack(side=tk.LEFT, padx=4)
 
     def _apply_resolution(self, dialog, width: int, height: int) -> None:
         """应用选中的分辨率 (MJPEG 热切换; H.264 需重启 streamer)."""
@@ -914,6 +925,22 @@ class MainWindow:
 
         # H.264: 需重启 streamer 并重连 (会短暂断流).
         self._switch_resolution_h264(width, height)
+
+    def _resume_auto_resolution(self, dialog) -> None:
+        """恢复自动降级 (解除手动锁定)."""
+        try:
+            dialog.destroy()
+        except Exception:
+            pass
+        vc = self.connection_manager.get_video_client() if self.connection_manager else None
+        if vc is None:
+            return
+        try:
+            vc.resolution_locked = False
+            vc.auto_res_enabled = True
+            self._update_device_status("已恢复自动分辨率调节")
+        except Exception as e:
+            print_log(LogLevel.WARN, self.log_title, f"恢复自动分辨率失败: {e!r}")
 
     def _sync_resolution_after_switch(self, width: int, height: int) -> None:
         """分辨率切换后, 同步显示尺寸与点击坐标基准 (无需重连)."""
