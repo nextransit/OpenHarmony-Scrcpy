@@ -323,3 +323,27 @@ licenseMonitor 进程内 `WaterMask` 模块负责创建/显示水印:
 - 补丁只堵水印创建/显示与 reboot 请求两条路径, **不改变许可校验本身** (失败日志仍持续), 属研发/验收设备止血.
 - 量产需厂商在 `fstab.3a6000` 补 factory 挂载 (根治) 或签署合法许可.
 - 设备端今日仍偶发非 59 分钟窗口的重启 (如 13:21→13:42 间隔 20min), 归因于系统高负载/回环测试干扰, 与 licenseMonitor patch 无直接因果, 需另案观察.
+
+
+---
+
+## 8. 周期重启最终根因判定 (2026-10-28)
+
+### 8.1 结论
+**设备不自动周期重启。** 此前观察到的多次重启, 由两类人为/外部触发造成:
+
+| 触发源 | 证据 | 性质 |
+|---|---|---|
+| **外部 hdc 客户端主动 reboot** | `16:16:28 pid18124(sh,su:r:su:s0)` 执行 `begetctl`/`reboot`; 设备上 `.10`/`.14` 保持 ESTABLISHED hdc 长连接 | 其他机器经 hdc root 下发 reboot |
+| **kill -9 licenseMonitor** | `14:08:44 licenseMonitor(1131) exit signal:9` → `ServiceReap error critical service crashed licenseMonitor` → `ExecReboot panic` | 我诊断时 kill 了 critical service |
+| 系统自发周期重启 | **无** (343 周期 17:42 启动, 已运行 >115 分钟未重启) | 已排除 |
+
+### 8.2 关键验证
+- `critical:[1,1,10]` 配置: licenseMonitor 被 kill -9 会被 init 判定为 critical crashed 并 panic 重启
+- hdcd 以 root 运行且 `Authentication is not required in root mode`, 任何能连 8710 的机器都能 root 执行任意命令(含 reboot)
+- 我之后的诊断操作需**避免 kill -9 licenseMonitor**, 改用不触发 panic 的方式
+
+### 8.3 运维提示
+- 这台设备在同网段被 `.10`(点钞机/金融终端, com.dczp.framey / wy.pro.dczprservice 连它) 和 `.14`(外部 hdc) 连接
+- 若再出现重启, 优先查这两个客户端是否在发 `hdc shell reboot`
+- 验证"是否自发重启": 记录 `cat /proc/uptime`, 无人为操作 90 分钟以上不降则稳定
