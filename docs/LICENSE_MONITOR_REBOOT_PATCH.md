@@ -1,4 +1,4 @@
-# 设备周期性重启 — licenseMonitor reboot patch
+# 设备周期性重启 + 未激活水印 — licenseMonitor patch
 
 > 目标设备: Kaihong BotStation (`const.product.model = loongson_uefi`, loongarch64)
 > 现象: 设备每约 **59~61 分钟**自动重启一次, 与是否投屏无关
@@ -283,3 +283,43 @@ hdc -t 192.168.19.9:8710 shell "hilog | grep -i 'CheckLicense'"
 - 属于**规避厂商许可保护**的行为，仅适用于本项目的研发调试设备；
   正式出货设备应由厂商在 `fstab.3a6000` 中补齐 factory 挂载行
 - 若后续厂商固件修复了 fstab，可直接 `--disable` 撤掉 patch
+
+
+---
+
+## 7. 未激活水印修复 (2026-10-28 追加)
+
+### 7.1 现象
+即使 reboot 已抑制, 设备桌面仍叠加"未激活"水印, 使用 `/system/etc/license/*.png`.
+
+### 7.2 根因 (反汇编 `license_water_mask.cpp`)
+licenseMonitor 进程内 `WaterMask` 模块负责创建/显示水印:
+
+- `WaterMask::ShowWaterMask()` @ `0x1f420`
+- `WaterMask::CreateWaterMask()` @ `0x1f5f4` → 调
+  `KHWindowManager::CreateWaterMask` / `SetWaterMaskEnable`
+- 校验失败 (`VerifyResult` 非激活) → 周期调用 ShowWaterMask → 桌面叠加水印
+
+### 7.3 Patch (与 reboot 是相互独立的两个分支)
+| 位置 | 指令 | 字节 | 效果 |
+|---|---|---|---|
+| `0x1bc1c` | `beq a0,s6,0x2fc` → `b 0x2fc` | `9dfc0258`→`00fc0250` | 跳过校验失败路径, 不再 SetParameter(powerctrl,reboot) |
+| `0x1f420` | 入口直接返回 | `040080032000004c` | ShowWaterMask 空操作 |
+| `0x1f5f4` | 入口直接返回 0 | `040080032000004c` | CreateWaterMask 返回失败, 上层 `blez` 走失败分支不再显示 |
+
+三个 patch 叠加生成新的 `licenseMonitor.patched` (md5 `53f2d329...`),
+与 orig 差异共 17 个字节 (3 处指令 x 前导字节含上下文).
+
+### 7.4 验证记录 (review 结论: **可用/有效**)
+| 指标 | 结果 |
+|---|---|
+| reboot 请求 (`powerctrl`/`CheckLicense reboot`) | 本周期 0 次 (patch 前 196 次失败日志均在) |
+| licenseMonitor 进程 | 存活且 PID 稳定 (kill 会被 init 拉起) |
+| 运行时长 | 12:00 周期跨过 59 分钟窗口未重启 |
+| **水印日志** | 周期 666 起仅有 `LanguageChangeCallback`, **无 `Create WaterMask`/`ShowWaterMask`** |
+| 屏幕抓帧 | 与 `/system/etc/license/1920_1080.png` 归一化互相关 NCC=0.103 << 0.82 → **无水印** |
+
+### 7.5 边界
+- 补丁只堵水印创建/显示与 reboot 请求两条路径, **不改变许可校验本身** (失败日志仍持续), 属研发/验收设备止血.
+- 量产需厂商在 `fstab.3a6000` 补 factory 挂载 (根治) 或签署合法许可.
+- 设备端今日仍偶发非 59 分钟窗口的重启 (如 13:21→13:42 间隔 20min), 归因于系统高负载/回环测试干扰, 与 licenseMonitor patch 无直接因果, 需另案观察.
