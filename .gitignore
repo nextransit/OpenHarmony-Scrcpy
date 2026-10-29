@@ -35,7 +35,7 @@ Thumbs.db
 .env.*
 *.env
 !.env.example
-# 厂商许可相关二进制产物 (逆向分析用, 不入库)
+# 厂商许可相关二进制产物 (逆向分析用, 不入库; 脚本 patch_license_monitor.py 要入库)
 scripts/license_patch/licenseMonitor.orig
 scripts/license_patch/licenseMonitor.patched
 scripts/license_patch/libklicapiservice.z.so
