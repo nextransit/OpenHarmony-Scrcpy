@@ -347,3 +347,68 @@ licenseMonitor 进程内 `WaterMask` 模块负责创建/显示水印:
 - 这台设备在同网段被 `.10`(点钞机/金融终端, com.dczp.framey / wy.pro.dczprservice 连它) 和 `.14`(外部 hdc) 连接
 - 若再出现重启, 优先查这两个客户端是否在发 `hdc shell reboot`
 - 验证"是否自发重启": 记录 `cat /proc/uptime`, 无人为操作 90 分钟以上不降则稳定
+
+---
+
+## 9. 水印 patch 落地验证 + 重启归因再确认 (2026-10-29)
+
+### 9.1 设备端实际状态 (真机确认)
+
+| 项 | 值 |
+|---|---|
+| `/system/bin/licenseMonitor` md5 | `53f2d329cfb4acda2eec17d94d304ef1` (**3 处 patch 全部生效**) |
+| SELinux 标签 | `u:r:licenseMonitor_exec:s0` (与原文件一致) |
+| init cfg | `/system/etc/init/khlicense_monitor.cfg` path 仍为 `/system/bin/licenseMonitor` (未改) |
+| 回滚备份 | `/data/local/tmp/license_patch/licenseMonitor.system.bak` md5 `ac21a9e6...` (原始二进制, 就位) |
+| `persist.plugin.set_device_reboot.enabled` | `false` |
+| `persist.license.monitor.interval` | `59` (分钟) |
+
+### 9.2 水印消除验证 (2026-10-29 10:48 实测)
+
+| 指标 | 结果 | 判定 |
+|---|---|---|
+| 桌面抓帧 vs `/system/etc/license/1920_1080.png` 归一化互相关 | **NCC = 0.326** (阈值 0.82) | **无水印** |
+| 抓帧目视 | 桌面清晰, 无"未激活"叠加层 | 通过 |
+| hilog 水印关键字 | 仅 `license_water_mask.cpp(173) LanguageChangeCallback`, **无 `Create WaterMask` / `ShowWaterMask`** | 通过 |
+
+### 9.3 重启归因再确认 (4 次重启全部外部触发)
+
+2026-10-29 观测到 4 次重启, 每次的 `Reboot cmd reboot` 之前 0.1s 均为:
+
+```
+HDC_LOG: [async_cmd.cpp:140] SetSelinuxLabel con:u:r:su:s0 isRoot:1
+APPSPAWN_CLIENT: [appspawn_mount_permission.c:154]LoadPermission 0
+BEGET: [init_reboot_innerkits.c:51]Reboot cmd reboot
+```
+
+| # | 时间 | 触发 PID | 归因 |
+|---|---|---|---|
+| 1 | 09:46:46 | 16347 | 外部 hdc root 客户端 |
+| 2 | 10:04:13 | 5157 | 外部 hdc root 客户端 |
+| 3 | 10:32:08 | 6095 | 外部 hdc root 客户端 |
+| 4 | 10:50:11 | 13319 | 外部 hdc root 客户端 |
+
+**patch 生效的正面证据**: 全量 hilog 检索 `CheckLicense fail` / `reboot soon` 在 patch 后周期为 **0 条**
+(对照: patch 前 693 周期 25 次 / 692 周期 114 次 `Read license data from factory fail`),
+仅剩 10:50:11 一条 `ohos.startup.powerctrl`, 其发起方正是上表中的 hdc root 会话.
+
+**结论**: licenseMonitor 已不再触发任何重启请求; 设备重启全部来自外部 hdc 客户端 (`192.168.19.10` / `192.168.19.14` 常驻连接).
+
+### 9.4 采集器缺陷修复
+
+`/tmp/reboot_evidence.py` 原用 `uptime // 10` 做去重, 启动后 300s 内槽位填满后不再采集, **导致 10:51 重启漏抓**.
+已改为按 `/proc/stat` 第 22 列 (btime) 去重, 每次新 boot 必抓一份证据.
+经 launchd (`com.decard.rebootev`) 常驻运行.
+
+### 9.5 脚本修正 (本轮)
+
+| 项 | 修正前 | 修正后 |
+|---|---|---|
+| patch 点数量 | 仅 reboot 一处 (`0x1bc1c`) | 三处 (`reboot` / `watermark-show` / `watermark-create`), 数据驱动 `PATCH_POINTS` 表 |
+| `--enable` / `--disable` | `kill -9 $(pidof licenseMonitor)` | **移除** — 该服务 `critical:[1,1,10]`, kill 会触发 init `ExecReboot panic`; 改为"替换后待下次重启生效" |
+| 上下文校验 | 硬编码单点, 语义为 `off-8:off-4` | 统一为"紧邻前/后一条指令", 长度可变, 支持 4↔8 字节等长替换 |
+| 幂等性 | 未验证 | 已验证: 二次 patch 返回 `already-patched`, md5 不变 |
+| 版本不匹配检测 | 单点 | 三个 patch 点均校验, 任一不匹配即中止 |
+
+**离线验证**: 用脚本从 `licenseMonitor.orig` 重新生成的产物与设备上已部署二进制 **逐字节一致**
+(md5 均为 `53f2d329cfb4acda2eec17d94d304ef1`), 证明脚本与实际部署产物等价.

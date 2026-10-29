@@ -110,19 +110,56 @@ REMOTE_BACKUP_BIN = f"{REMOTE_WORKDIR}/licenseMonitor.system.bak"
 # init 服务配置 (在 /system, 只读)
 REMOTE_CFG = "/system/etc/init/khlicense_monitor.cfg"
 
-# patch 位置: 虚拟地址 0x1bc1c 处的 beq 指令
-PATCH_VADDR = 0x1BC1C
 # .text 段: vaddr 0x19000 -> paddr 0x15000 (相差 0x4000)
 TEXT_VADDR = 0x19000
 TEXT_PADDR = 0x15000
 
-OLD_BYTES = bytes.fromhex("9dfc0258")   # beq a0, s6, 0x2fc
-NEW_BYTES = bytes.fromhex("00fc0250")   # b   0x2fc
-NEW_DISASM = "b 0x2fc"
-
-# 用于校验的上下文指令 (patch 点前后), 期望在 patched 文件里匹配
-CTX_BEFORE = bytes.fromhex("003cfd54")   # 0x1bc14 bl VerifyLicense
-CTX_AFTER = bytes.fromhex("a4011a14")    # 0x1bc20 lu12i.w a0, 0xd00d
+# patch 点表: (名称, vaddr, 原始字节, 新字节, 反汇编说明, 上下文校验说明)
+#
+# 1) reboot 抑制: 许可校验失败分支 beq -> 无条件跳转, 让失败路径也走成功路径,
+#    从而不调用 SetParameter("ohos.startup.powerctrl", "reboot").
+# 2) 水印显示: WaterMask::ShowWaterMask() 入口直接返回 (空操作).
+# 3) 水印创建: WaterMask::CreateWaterMask() 入口直接返回 0, 上层 blez 走失败分支,
+#    不再请求 KHWindowManager 创建水印窗口.
+#
+# 三处均为 4 字节指令原地替换, 总计 12 字节差异.
+# 每项:
+#   old      -- 原始指令字节 (长度 = 被替换的字节数)
+#   new      -- patch 后字节 (可与 old 不同长度: 水印处 4 -> 8 字节)
+#   ctx_before -- 位于 patch 点之前的上下文, 用于确认二进制版本一致 (可为 b"")
+#   ctx_after  -- 位于 patch 点之后 (跳过 new 长度) 的上下文, 用于确认版本一致
+PATCH_POINTS = [
+    {
+        "name": "reboot",
+        "vaddr": 0x1BC1C,
+        # 等长替换: 4 字节 -> 4 字节
+        "old": bytes.fromhex("9dfc0258"),           # beq a0, s6, 0x2fc
+        "new": bytes.fromhex("00fc0250"),           # b   0x2fc
+        "disasm": "beq a0,s6,0x2fc -> b 0x2fc",
+        "ctx_before": bytes.fromhex("9c001500"),    # 0x1bc18 (patch 点前一条指令)
+        "ctx_after": bytes.fromhex("a4011a14"),     # 0x1bc20 (patch 点后一条指令)
+    },
+    {
+        "name": "watermark-show",
+        "vaddr": 0x1F420,
+        # 等长替换: 8 字节 -> 8 字节 (原 bl + 紧随的一条指令被一并覆盖)
+        "old": bytes.fromhex("63c0fe026120c129"),   # bl <ShowWaterMask> ; ld.d a1,a0,0
+        "new": bytes.fromhex("040080032000004c"),   # ori a0,a0,0 ; jirl ra,0
+        "disasm": "ShowWaterMask -> ori a0,a0,0 ; jirl ra,0 (空操作)",
+        "ctx_before": bytes.fromhex("ff97fe53"),    # 0x1f41c (patch 点前一条指令)
+        "ctx_after": bytes.fromhex("7600c129"),     # 0x1f428 (patch 后第一条指令)
+    },
+    {
+        "name": "watermark-create",
+        "vaddr": 0x1F5F4,
+        # 等长替换: 8 字节 -> 8 字节
+        "old": bytes.fromhex("6300fe0261e0c129"),   # bl <CreateWaterMask> ; ld.d a1,a0,0
+        "new": bytes.fromhex("040080032000004c"),   # ori a0,a0,0 ; jirl ra,0
+        "disasm": "CreateWaterMask -> ori a0,a0,0 ; jirl ra,0 (返回 0)",
+        "ctx_before": bytes.fromhex("00800156"),    # 0x1f5f0 (patch 点前一条指令)
+        "ctx_after": bytes.fromhex("76c0c129"),     # 0x1f5fc (patch 后第一条指令)
+    },
+]
 
 
 def log(msg: str) -> None:
@@ -198,46 +235,66 @@ def paddr_of(vaddr: int) -> int:
 
 
 def patch_bytes(data: bytearray) -> str:
-    """对内存中的 ELF 做 patch. 返回状态字符串."""
-    off = paddr_of(PATCH_VADDR)
-    if off < 0 or off + 4 > len(data):
-        die(f"patch 偏移越界: {hex(off)} (文件大小 {len(data)})")
+    """对内存中的 ELF 做 patch (全部 PATCH_POINTS). 返回状态字符串.
 
-    cur = bytes(data[off:off + 4])
+    状态: "patched" (有改动) / "already-patched" (已是 patch 后状态).
+    任一 patch 点上下文不匹配即中止, 避免在版本不同的二进制上打错补丁.
+    """
+    changed = False
+    for pt in PATCH_POINTS:
+        off = paddr_of(pt["vaddr"])
+        old_len = len(pt["old"])
+        new_len = len(pt["new"])
+        if off < 0 or off + max(old_len, new_len) > len(data):
+            die(f"[{pt['name']}] patch 偏移越界: {hex(off)} (文件大小 {len(data)})")
 
-    # 上下文校验: 确认这就是目标函数的分支指令
-    before = bytes(data[off - 8:off - 4])
-    after = bytes(data[off + 4:off + 8])
-    if before != CTX_BEFORE:
-        die(f"上下文不匹配 (bl VerifyLicense 期望 {CTX_BEFORE.hex()}, "
-            f"实际 {before.hex()}) — 二进制版本可能不同")
-    if after != CTX_AFTER:
-        die(f"上下文不匹配 (patch 后指令 期望 {CTX_AFTER.hex()}, "
-            f"实际 {after.hex()}) — 二进制版本可能不同")
+        # 上下文校验 (确认二进制版本一致)
+        cb = pt["ctx_before"]
+        if cb:
+            before = bytes(data[off - len(cb):off])
+            if before != cb:
+                die(f"[{pt['name']}] 前置上下文不匹配 (期望 {cb.hex()}, "
+                    f"实际 {before.hex()}) — 二进制版本可能不同")
+        ca = pt["ctx_after"]
+        if ca:
+            # ctx_after 紧邻 patch 点之后 (patch 后的第一条指令)
+            after = bytes(data[off + new_len:off + new_len + len(ca)])
+            if after != ca:
+                die(f"[{pt['name']}] 后置上下文不匹配 (期望 {ca.hex()}, "
+                    f"实际 {after.hex()}) — 二进制版本可能不同")
 
-    if cur == NEW_BYTES:
-        return "already-patched"
-    if cur != OLD_BYTES:
-        die(f"目标指令不匹配: 期望 {OLD_BYTES.hex()} (beq a0, s6, 0x2fc), "
-            f"实际 {cur.hex()} — 二进制版本可能不同")
+        cur = bytes(data[off:off + old_len])
+        if cur == pt["new"][:old_len] and bytes(data[off:off + new_len]) == pt["new"]:
+            continue  # 已是 patch 后状态
+        if cur != pt["old"]:
+            die(f"[{pt['name']}] 目标指令不匹配: 期望 {pt['old'].hex()}, "
+                f"实际 {cur.hex()} — 二进制版本可能不同")
 
-    data[off:off + 4] = NEW_BYTES
-    return "patched"
+        data[off:off + old_len] = pt["new"]
+        changed = True
+    return "patched" if changed else "already-patched"
 
 
 def verify_patched(path: str) -> dict:
-    """检查本地文件是否已打 patch."""
+    """检查本地文件每个 patch 点的状态."""
     with open(path, "rb") as f:
         data = f.read()
-    off = paddr_of(PATCH_VADDR)
-    cur = bytes(data[off:off + 4])
-    return {
-        "offset": off,
-        "bytes": cur.hex(),
-        "patched": cur == NEW_BYTES,
-        "original": cur == OLD_BYTES,
-        "size": len(data),
-    }
+    points = []
+    all_patched = True
+    for pt in PATCH_POINTS:
+        off = paddr_of(pt["vaddr"])
+        cur = bytes(data[off:off + len(pt["new"])])
+        is_patched = cur == pt["new"]
+        is_original = bytes(data[off:off + len(pt["old"])]) == pt["old"]
+        all_patched = all_patched and is_patched
+        points.append({
+            "name": pt["name"],
+            "offset": off,
+            "bytes": cur.hex(),
+            "patched": is_patched,
+            "original": is_original,
+        })
+    return {"points": points, "patched": all_patched, "size": len(data)}
 
 
 def check_elf(path: str) -> dict:
@@ -330,11 +387,15 @@ def device_enable(hdc: Hdc) -> None:
         log("警告: 未看到 licenseMonitor_exec 标签, 请人工确认 (chcon 可能不可用)")
     # 5) 还原 cfg 为原样 (确保 init 路径不变)
     hdc.shell(f"cp {REMOTE_CFG_BACKUP} {REMOTE_CFG} 2>/dev/null")
-    # 6) 重启 licenseMonitor (init 会按原 cfg 重启它)
-    hdc.shell("kill -9 $(pidof licenseMonitor) 2>/dev/null")
-    # 7) 恢复根分区只读
+    # 6) 恢复根分区只读
     hdc.shell("mount -o remount,ro / 2>/dev/null")
-    log("启用完成. 验证: hdc shell 'pidof licenseMonitor' + 'ls -laZ /system/bin/licenseMonitor'")
+    # 7) 生效方式: **不 kill licenseMonitor**.
+    #    licenseMonitor 在 init cfg 里是 critical 服务, 被 kill -9 后 init 判定
+    #    "critical service crashed" 会触发 ExecReboot panic (实测导致设备重启).
+    #    替换二进制后, 等下一次设备重启自然生效即可; 若必须立刻生效,
+    #    由调用方显式执行 `hdc shell reboot` (与补丁本身无关的正常重启).
+    log("启用完成 (二进制已替换, 待下次设备重启后生效). "
+        "验证: hdc shell 'md5sum /system/bin/licenseMonitor' + 'ls -laZ /system/bin/licenseMonitor'")
 
 
 def device_disable(hdc: Hdc) -> None:
@@ -358,9 +419,9 @@ def device_disable(hdc: Hdc) -> None:
     else:
         hdc.shell(f"sed -i 's|{REMOTE_PATCHED}|{REMOTE_BIN}|g' {REMOTE_CFG}")
         log("已把 cfg path 改回原值")
-    hdc.shell("kill -9 $(pidof licenseMonitor) 2>/dev/null")
     hdc.shell("mount -o remount,ro / 2>/dev/null")
-    log("已恢复原状")
+    log("已恢复原状 (二进制已还原, 待下次设备重启后生效; 不要 kill -9 licenseMonitor, "
+        "它是 critical 服务, 会触发 init ExecReboot panic)")
 
 
 def device_file_exists(hdc: Hdc, path: str) -> bool:
@@ -432,13 +493,18 @@ def main() -> int:
     if status == "patched":
         with open(local, "wb") as f:
             f.write(data)
-        log(f"patch 完成: 偏移 {hex(paddr_of(PATCH_VADDR))} "
-            f"{OLD_BYTES.hex()} -> {NEW_BYTES.hex()}  ({NEW_DISASM})")
+        for pt in PATCH_POINTS:
+            log(f"patch [{pt['name']}]: 偏移 {hex(paddr_of(pt['vaddr']))} "
+                f"{pt['old'].hex()} -> {pt['new'].hex()}  ({pt['disasm']})")
     else:
         log("文件已是 patched 状态, 跳过")
 
     v = verify_patched(local)
-    log(f"校验: offset={hex(v['offset'])} bytes={v['bytes']} patched={v['patched']}")
+    for pt in v["points"]:
+        log(f"校验 [{pt['name']}]: offset={hex(pt['offset'])} "
+            f"bytes={pt['bytes']} patched={pt['patched']} original={pt['original']}")
+    if not v["patched"]:
+        die("patch 后校验未全部通过")
 
     if args.output:
         log(f"本地输出: {local}")
