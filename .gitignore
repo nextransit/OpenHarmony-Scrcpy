@@ -40,3 +40,8 @@ scripts/license_patch/licenseMonitor.orig
 scripts/license_patch/licenseMonitor.patched
 scripts/license_patch/libklicapiservice.z.so
 scripts/license_patch/__pycache__/
+
+# 本地临时工作目录 (水印素材 / 诊断日志 / 截图), 不入库
+# 注意: docs/BOOT_ANIMATION_HANG_20261029.md 引用的 tmp/loop_error.log
+#       是 3.6MB 本地诊断日志, 结论已写入文档正文, 不需要入库.
+tmp/
