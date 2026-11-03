@@ -49,6 +49,11 @@ echo ""
 echo "== 5) tests/test_click_async.py (点击链路) =="
 "$PY" tests/test_click_async.py
 
+# 6. MJPEG 部署就绪判定 + 帧率自适应分辨率 (回归)
+echo ""
+echo "== 6) tests/test_mjpeg_deploy_readiness.py (部署就绪 + 帧率判据) =="
+"$PY" tests/test_mjpeg_deploy_readiness.py
+
 echo ""
 echo "============================================================"
 echo "全部通过"

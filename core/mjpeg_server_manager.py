@@ -43,6 +43,8 @@ class MjpegServerManager:
     # 因此降分辨率并不能提高帧率.
     DEFAULT_WORKERS = 4
     LOOP_PID_FILE = "/data/local/tmp/ohscrcpy_mjpeg_loop.pid"
+    # 设备端抓帧文件基名 (jpeg_server 的 -f 参数).
+    CAPTURE_FILE_BASE = "/data/local/tmp/ohscrcpy_screen"
     
     def __init__(self, hdc_executor: HDCCommandExecutor) -> None:
         self.hdc = hdc_executor
@@ -126,10 +128,21 @@ class MjpegServerManager:
                 print_log(LogLevel.ERROR, self.log_title, "后台截图循环启动失败")
                 return False
 
-        # 5. 端口转发
-        if not self._setup_port_forward(port, port):
-            print_log(LogLevel.ERROR, self.log_title, "端口转发建立失败")
-            return False
+        # 5. 端口转发 (hdc fport).
+        #    直连设备 IP 时客户端根本不走 fport, 所以 fport 失败不该中断部署 ——
+        #    否则"服务已起好、只是转发没建起来"会被误报成部署失败.
+        #    USB 设备 (无 IP) 才真正依赖 fport, 那时失败才算致命.
+        fport_ok = self._setup_port_forward(port, port)
+        direct = self._direct_host()
+        if not fport_ok:
+            if direct:
+                print_log(LogLevel.WARN, self.log_title,
+                    "端口转发建立失败, 但客户端将直连设备 IP "
+                    f"({direct}:{port}), 继续部署")
+            else:
+                print_log(LogLevel.ERROR, self.log_title,
+                    "端口转发建立失败, 且设备无可直连地址 (USB 连接必须依赖 fport)")
+                return False
 
         # 自动分辨率: width/height 为 0 时传 0 给设备端,
         # jpeg_server 启动时自己探测物理分辨率并按其抓帧 (最高画质).
@@ -142,7 +155,7 @@ class MjpegServerManager:
 
         # 客户端应连接的地址: 网络设备优先直连 (免 hdc fport 转发,
         # 实测直连延迟 0.02ms vs fport 15-57ms, 且 hdc 转发机制在设备上不稳定).
-        self.client_host = self._direct_host() or "127.0.0.1"
+        self.client_host = direct or "127.0.0.1"
         print_log(LogLevel.INFO, self.log_title,
             f"MJPEG 服务部署成功: http://{self.client_host}:{port}/screen.mjpeg")
         return True
@@ -220,38 +233,95 @@ class MjpegServerManager:
             f"jpeg_server 已推送: {local} (arch={actual or '未知'}) -> {remote}")
         return True
 
+    def _capture_file_glob(self) -> str:
+        """设备端实际会产出的抓帧文件 glob.
+
+        jpeg_server (device/jpeg_server.cpp) 在 worker > 1 时把每个 worker 的帧
+        写到独立副文件 (xxx.w0.jpeg / xxx.w1.jpeg / ...), 只有 worker == 1 才写
+        主文件. 所以"主文件在不在"根本不是服务就绪的判据.
+        """
+        if self.workers > 1:
+            return f"{self.CAPTURE_FILE_BASE}.w*.jpeg"
+        return f"{self.CAPTURE_FILE_BASE}.jpeg"
+
+    def _probe_frame_over_http(self, timeout: float = 2.0) -> bool:
+        """通过 HTTP 探测设备端是否真的产出了可服务的帧 (权威判据).
+
+        jpeg_server 的帧保存在**进程内存**里 (g_frame), 磁盘上的 jpeg 文件只是
+        snapshot_display 的副产物 —— 文件存在 != 服务可用.
+        /screen.jpeg 返回 200 且带 JPEG 魔数 (FFD8) 才说明真的有帧可发.
+        """
+        host = self._direct_host()
+        if not host:
+            return False
+        try:
+            import urllib.request
+            with urllib.request.urlopen(
+                    f"http://{host}:{self.port}/screen.jpeg", timeout=timeout) as resp:
+                head = resp.read(4)
+                return resp.status == 200 and len(head) >= 2 \
+                    and head[0] == 0xFF and head[1] == 0xD8
+        except Exception:
+            return False
+
+    def _probe_capture_files(self) -> bool:
+        """兜底探测: 检查设备端抓帧文件是否已产出有效大小的帧.
+
+        仅在无法直连设备 IP (如 USB 连接) 时使用.
+        """
+        r = self._exec("shell",
+                       f"ls -l {self._capture_file_glob()} 2>/dev/null", timeout=5)
+        for line in (r.get("stdout") or "").splitlines():
+            parts = line.split()
+            # ls -l 输出: -rw-r--r-- 1 root root <size> <date> <time> <name>
+            if len(parts) >= 5 and parts[0].startswith("-"):
+                try:
+                    if int(parts[4]) > 1024:
+                        return True
+                except ValueError:
+                    continue
+        return False
+
     def _start_jpeg_server(self) -> bool:
         """启动设备端 jpeg_server (自带抓帧循环 + HTTP 服务)."""
         remote = "/data/local/tmp/ohscrcpy_jpeg_server"
         self._exec("shell", f"pkill -9 -f {remote} 2>/dev/null", timeout=5)
         time.sleep(0.3)
+        # 清掉上一轮遗留的抓帧文件, 否则文件兜底探测会被陈旧文件骗过
+        # (worker > 1 时 jpeg_server 只写 .wN.jpeg, 主文件可能是老版本残留).
+        self._exec("shell",
+                   f"rm -f {self.CAPTURE_FILE_BASE}*.jpeg 2>/dev/null", timeout=5)
         cmd = (f"nohup {remote} -p {self.port} -w {self.width} -h {self.height} "
                f"-i {self.interval} -n {self.workers} "
-               f"-f /data/local/tmp/ohscrcpy_screen.jpeg "
+               f"-f {self.CAPTURE_FILE_BASE}.jpeg "
                f"> /data/local/tmp/ohscrcpy_jpeg_server.log 2>&1 < /dev/null &")
         self._exec("shell", cmd, timeout=8)
 
-        # 等待监听 + 首帧就绪
-        for attempt in range(10):
+        # 等待监听 + 首帧就绪.
+        # 判据优先级: HTTP 首帧 (权威) > 抓帧文件 (兜底, 仅 USB 连接可用).
+        for attempt in range(15):
             time.sleep(0.6)
             r = self._exec("shell",
                            f"netstat -an 2>/dev/null | grep 'tcp.*:{self.port}.*LISTEN'",
                            timeout=5)
-            if (r.get("stdout") or "").strip():
+            if not (r.get("stdout") or "").strip():
+                continue
+            print_log(LogLevel.INFO, self.log_title,
+                f"jpeg_server 已监听 {self.port} (尝试 {attempt+1}/15)")
+            if self._probe_frame_over_http():
                 print_log(LogLevel.INFO, self.log_title,
-                    f"jpeg_server 已监听 {self.port} (尝试 {attempt+1}/10)")
-                # 再确认抓到帧
-                r2 = self._exec("shell",
-                                "ls -la /data/local/tmp/ohscrcpy_screen.jpeg 2>/dev/null",
-                                timeout=5)
-                if (r2.get("stdout") or "").strip():
-                    return True
-                print_log(LogLevel.WARN, self.log_title, "jpeg_server 已监听但暂无截图文件")
+                    "jpeg_server 首帧就绪 (HTTP 探测通过)")
+                return True
+            if self._probe_capture_files():
+                print_log(LogLevel.INFO, self.log_title,
+                    "jpeg_server 首帧就绪 (抓帧文件探测通过)")
+                return True
+            print_log(LogLevel.WARN, self.log_title, "jpeg_server 已监听但暂无首帧")
         log = self._exec("shell",
                          "cat /data/local/tmp/ohscrcpy_jpeg_server.log 2>/dev/null | tail -10",
                          timeout=5)
         print_log(LogLevel.ERROR, self.log_title,
-            f"jpeg_server 未监听 {self.port}. 日志: {(log.get('stdout') or '')[-400:]}")
+            f"jpeg_server 未就绪 ({self.port}). 日志: {(log.get('stdout') or '')[-400:]}")
         return False
     
     def _exec(self, *args, timeout=10):

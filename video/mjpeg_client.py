@@ -73,19 +73,35 @@ class MjpegStreamClient:
     AUTO_RES_ENABLED = True
     # 降级阶梯 (从高到低)
     AUTO_RES_LADDER = [(1920, 1080), (1280, 720), (960, 540), (640, 360)]
-    # 低于该速率 (Mbps) 判定带宽不足, 降一级.
-    # 依据上表实测带宽 (8.8 / 8.9 / 8.3 / 4.7 Mbps) 留余量后标定.
-    AUTO_RES_MIN_MBPS_BY_LEVEL = {
-        (1920, 1080): 5.0,
-        (1280, 720): 5.0,
-        (960, 540): 4.0,
-        (640, 360): 2.0,
-    }
-    AUTO_RES_MIN_MBPS = 4.0   # 阶梯里没有匹配项时的兜底值
+    # 低于该帧率 (fps) 判定太卡, 降一级.
+    #
+    # [为什么用帧率而不是带宽做判据]
+    # 真机实测 (loongarch 8 核, 1080p, MJPEG multipart 端到端) 各档位接收带宽
+    # **几乎恒定** (8.8 / 8.9 / 8.3 / 4.7 Mbps), 帧率却随分辨率线性下降
+    # (1.20 / 2.20 / 3.49 / 6.59 fps). 带宽是**结果**, 帧率才是**体感**:
+    # 用带宽判据时, 1080p 需要的 5Mbps 阈值被 8.8Mbps 的实测值满足 ->
+    # 永远不会降级, 用户却一直卡在 1.2fps.
+    # 唯一能区分档位的信号是帧率, 所以判据改成帧率.
+    #
+    # 阈值取 8fps: 实测各档位**稳定**帧率 (1080p 3.6 / 720p 7.4 / 540p 11.6 /
+    # 360p 19.7 fps), 8fps 落在 720p 与 540p 之间 —— 720p 不达标会降级,
+    # 540p 达标后稳定, 于是系统收敛到 960x540 (~11.6fps) 这个单点.
+    #
+    # 升档门槛必须**明显高于**降档门槛, 否则会在两档之间来回横跳:
+    # 若升档门槛 = 降档门槛, 360p(19.7fps) 满足 -> 升到 540p, 540p(11.6fps)
+    # 若低于降档阈值 -> 又降回 360p, 无限震荡. 这里取 1.8 倍 (14.4fps),
+    # 540p 实测 11.6fps 达不到 -> 稳定停在 540p; 链路变快时 (>14.4fps)
+    # 才会继续往上走.
+    AUTO_RES_MIN_FPS = 8.0
+    # 升档门槛 = MIN_FPS * 该系数
+    AUTO_RES_UPGRADE_RATIO = 1.8
     # 连续多少个采样窗口低于阈值才降级 (避免抖动误判)
-    AUTO_RES_SLOW_WINDOWS = 3
-    # 连续多少个窗口带宽富余才升档 (比降级更保守, 避免来回横跳)
-    AUTO_RES_FAST_WINDOWS = 6
+    AUTO_RES_SLOW_WINDOWS = 2
+    # 连续多少个窗口帧率富余才升档 (比降级更保守, 避免来回横跳)
+    AUTO_RES_FAST_WINDOWS = 4
+    # 改档后的静默期 (秒): 切换瞬间管道里还混着旧分辨率的帧,
+    # 这段时间内不做任何档位判断, 否则会被过渡帧误导.
+    AUTO_RES_SETTLE_S = 8.0
     
     def __init__(
         self,
@@ -131,6 +147,9 @@ class MjpegStreamClient:
         self._auto_res_fast_count: int = 0   # 连续高速窗口计数 (升档用)
         self._auto_res_last_check: float = 0.0
         self._auto_res_bytes_mark: int = 0
+        self._auto_res_frame_mark: int = 0
+        # 最近一次改档时间 (静默期内不判定)
+        self._auto_res_changed_at: float = 0.0
         self.last_data_time: float = 0
         self.last_frame_time: float = 0
         self.bad_packet_bytes: int = 0
@@ -668,11 +687,14 @@ class MjpegStreamClient:
             return None
 
     def _check_auto_resolution(self) -> None:
-        """按实测接收速率自动调整抓帧分辨率.
+        """按实测帧率自动调整抓帧分辨率.
 
-        带宽不足 (接收速率低于 AUTO_RES_MIN_MBPS) 且连续多个窗口都这样,
+        帧率过低 (低于 AUTO_RES_MIN_FPS) 且连续多个窗口都这样,
         就降一级分辨率. 设备端 jpeg_server 支持 GET /screen.res?w=&h= 运行时调整,
         不需要重启服务.
+
+        判据用帧率而非带宽: 真机实测各档位带宽几乎恒定 (8-9 Mbps), 只有帧率
+        能区分档位好坏. 详见 AUTO_RES_MIN_FPS 的注释.
         """
         if not self.AUTO_RES_ENABLED or not self.auto_res_enabled:
             return
@@ -682,29 +704,34 @@ class MjpegStreamClient:
         now = time.time()
         if now - self._auto_res_last_check < 3.0:
             return
+        window = now - self._auto_res_last_check
         self._auto_res_last_check = now
 
-        # 3 秒窗口内的接收速率
+        # 窗口内的接收速率 + 帧率
         bytes_in_window = self.total_bytes - self._auto_res_bytes_mark
         self._auto_res_bytes_mark = self.total_bytes
-        mbps = bytes_in_window * 8 / 3.0 / 1_000_000.0
+        frames_in_window = self.frame_count - self._auto_res_frame_mark
+        self._auto_res_frame_mark = self.frame_count
+        mbps = bytes_in_window * 8 / window / 1_000_000.0
+        fps = frames_in_window / window if window > 0 else 0.0
 
-        cur = self.AUTO_RES_LADDER[self._auto_res_index]
-        threshold = self.AUTO_RES_MIN_MBPS_BY_LEVEL.get(cur, self.AUTO_RES_MIN_MBPS)
-        if mbps < threshold:
+        # 改档后的静默期: 管道里混着旧分辨率的过渡帧, 此时判定不可信.
+        if self._auto_res_changed_at and (now - self._auto_res_changed_at) < self.AUTO_RES_SETTLE_S:
+            self._auto_res_slow_count = 0
+            self._auto_res_fast_count = 0
+            self._auto_res_frame_mark = self.frame_count
+            return
+
+        threshold = self.AUTO_RES_MIN_FPS
+        if fps < threshold:
             self._auto_res_slow_count += 1
             self._auto_res_fast_count = 0
         else:
             self._auto_res_slow_count = 0
-            # 带宽明显富余 (超过下一档阈值的 1.5 倍) 且已降过档 -> 尝试升回去.
-            # 连续多个窗口都满足才升, 避免在临界点反复横跳.
-            if self._auto_res_index > 0:
-                nxt = self.AUTO_RES_LADDER[self._auto_res_index - 1]
-                up_threshold = self.AUTO_RES_MIN_MBPS_BY_LEVEL.get(nxt, self.AUTO_RES_MIN_MBPS)
-                if mbps > up_threshold * 1.5:
-                    self._auto_res_fast_count += 1
-                else:
-                    self._auto_res_fast_count = 0
+            # 帧率明显富余 (超过升档门槛) 且已降过档 -> 尝试升回去.
+            # 升档门槛明显高于降档门槛 (AUTO_RES_UPGRADE_RATIO), 避免来回横跳.
+            if self._auto_res_index > 0 and fps >= threshold * self.AUTO_RES_UPGRADE_RATIO:
+                self._auto_res_fast_count += 1
             else:
                 self._auto_res_fast_count = 0
 
@@ -714,7 +741,7 @@ class MjpegStreamClient:
                 self._auto_res_index += 1
                 w, h = self.AUTO_RES_LADDER[self._auto_res_index]
                 print_log(LogLevel.WARN, self.log_title,
-                    f"带宽不足 ({mbps:.0f} Mbps < {threshold:.0f}), "
+                    f"帧率偏低 ({fps:.1f} fps < {threshold:.0f}, {mbps:.0f} Mbps), "
                     f"自动降级分辨率到 {w}x{h}")
                 if self._request_resolution(w, h):
                     # 设备端已改档, 必须同步 config —— 它是点击坐标换算的基准,
@@ -722,19 +749,21 @@ class MjpegStreamClient:
                     # 不同步会导致: 手动切回高分辨率时被误判为"已是"而什么都不做.
                     self.config.width = w
                     self.config.height = h
+                    self._auto_res_changed_at = now
             else:
                 print_log(LogLevel.WARN, self.log_title,
-                    f"带宽不足 ({mbps:.0f} Mbps < {threshold:.0f}) "
+                    f"帧率偏低 ({fps:.1f} fps < {threshold:.0f}) "
                     f"且已到最低分辨率 {self.AUTO_RES_LADDER[-1]}")
         elif self._auto_res_fast_count >= self.AUTO_RES_FAST_WINDOWS:
             self._auto_res_fast_count = 0
             self._auto_res_index -= 1
             w, h = self.AUTO_RES_LADDER[self._auto_res_index]
             print_log(LogLevel.INFO, self.log_title,
-                f"带宽恢复 ({mbps:.0f} Mbps), 自动升回分辨率 {w}x{h}")
+                f"帧率恢复 ({fps:.1f} fps, {mbps:.0f} Mbps), 自动升回分辨率 {w}x{h}")
             if self._request_resolution(w, h):
                 self.config.width = w
                 self.config.height = h
+                self._auto_res_changed_at = now
 
     def _request_resolution(self, width: int, height: int) -> bool:
         """请求设备端调整抓帧分辨率 (GET /screen.res?w=&h=).
@@ -826,6 +855,10 @@ class MjpegStreamClient:
                 f"设备端分辨率已是 {width}x{height}, 无需切换")
             self.config.width = width
             self.config.height = height
+            # 手动选择同样要锁定: 否则用户选了 1080p, 自动降级下一窗口就把它
+            # 改回 540p (表现为"选了没用, 画面很糊").
+            self.resolution_locked = True
+            self.auto_res_enabled = False
             return True
 
         if not self._request_resolution(width, height):
